@@ -1,0 +1,37 @@
+# Docker Compose for multi-arch testing
+#
+# Run tests on current architecture:
+#   docker compose run --rm test
+#
+# Build and test for specific architecture:
+#   docker compose run --rm test-amd64
+#   docker compose run --rm test-arm64
+#
+# Interactive shell:
+#   docker compose run --rm shell
+
+services:
+  test:
+    build:
+      context: .
+      target: test
+    platform: ${PLATFORM:-linux/arm64}
+
+  test-amd64:
+    build:
+      context: .
+      target: test
+    platform: linux/amd64
+
+  test-arm64:
+    build:
+      context: .
+      target: test
+    platform: linux/arm64
+
+  shell:
+    build:
+      context: .
+      target: interactive
+    stdin_open: true
+    tty: true
