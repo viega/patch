@@ -4,15 +4,83 @@
 
 #include <mach/mach.h>
 #include <mach/vm_map.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #ifdef PATCH_ARCH_ARM64
     #include <libkern/OSCacheControl.h>
 #endif
+
+// Writing to code memory on macOS is challenging due to:
+// 1. Code signing - signed code cannot be modified
+// 2. Hardware W^X on Apple Silicon - pages can't be W+X simultaneously
+//
+// We try multiple approaches in order of preference:
+// 1. vm_write (works for self-modifying code in some contexts)
+// 2. mprotect + memcpy (works for unsigned/ad-hoc signed binaries)
+// 3. Return error with guidance
+
+patch_error_t
+platform_write_code(void *addr, const void *data, size_t size)
+{
+    mach_port_t   task = mach_task_self();
+    kern_return_t kr;
+
+    // Approach 1: Try vm_write directly
+    // This can work for writing to our own process in some cases
+    kr = vm_write(task,
+                  (vm_address_t)addr,
+                  (vm_offset_t)data,
+                  (mach_msg_type_number_t)size);
+    if (kr == KERN_SUCCESS) {
+        platform_flush_icache(addr, size);
+        return PATCH_SUCCESS;
+    }
+
+    // Approach 2: Try mprotect to make writable, then write
+    size_t ps          = platform_page_size();
+    void  *page_start  = platform_page_align(addr);
+    size_t offset      = (uintptr_t)addr - (uintptr_t)page_start;
+    size_t region_size = ((offset + size + ps - 1) / ps) * ps;
+
+    // Try to change protection to RWX
+    kr = vm_protect(task, (vm_address_t)page_start, region_size, FALSE,
+                    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr == KERN_SUCCESS) {
+        memcpy(addr, data, size);
+
+        // Restore to RX
+        vm_protect(task, (vm_address_t)page_start, region_size, FALSE,
+                   VM_PROT_READ | VM_PROT_EXECUTE);
+
+        platform_flush_icache(addr, size);
+        return PATCH_SUCCESS;
+    }
+
+    // Approach 3: Try setting max protection first
+    kr = vm_protect(task, (vm_address_t)page_start, region_size, TRUE,
+                    VM_PROT_ALL);
+    if (kr == KERN_SUCCESS) {
+        kr = vm_protect(task, (vm_address_t)page_start, region_size, FALSE,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        if (kr == KERN_SUCCESS) {
+            memcpy(addr, data, size);
+            vm_protect(task, (vm_address_t)page_start, region_size, FALSE,
+                       VM_PROT_READ | VM_PROT_EXECUTE);
+            platform_flush_icache(addr, size);
+            return PATCH_SUCCESS;
+        }
+    }
+
+    // All approaches failed
+    // On macOS with hardened runtime, code modification is blocked
+    return PATCH_ERR_MEMORY_PROTECTION;
+}
 
 static int
 prot_to_mach(mem_prot_t prot)

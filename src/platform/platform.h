@@ -33,3 +33,8 @@ size_t platform_page_size(void);
 
 // Align address down to page boundary.
 void *platform_page_align(void *addr);
+
+// Write to code memory (handles platform-specific protections).
+// This is the preferred method for patching code on platforms with
+// strict memory protection (e.g., macOS with hardened runtime).
+patch_error_t platform_write_code(void *addr, const void *data, size_t size);

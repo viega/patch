@@ -89,56 +89,40 @@ patch__write_detour(void *target, void *destination, size_t available_size)
         return PATCH_ERR_INSUFFICIENT_SPACE;
     }
 
-    // Make target writable
-    void  *page      = platform_page_align(target);
-    size_t page_size = platform_page_size();
-    size_t offset    = (uintptr_t)target - (uintptr_t)page;
-    size_t region_size = offset + available_size;
-    if (region_size > page_size) {
-        region_size = ((region_size + page_size - 1) / page_size) * page_size;
-    }
-    else {
-        region_size = page_size;
-    }
+    // Build the detour code in a temporary buffer
+    uint8_t detour_buf[32];
+    memset(detour_buf, 0, sizeof(detour_buf));
 
-    patch_error_t err = platform_protect(page, region_size, MEM_PROT_RWX);
-    if (err != PATCH_SUCCESS) {
-        patch__set_error("Failed to make target writable");
-        return err;
-    }
-
-    // Write the jump
-    size_t written = arch_write_jump((uint8_t *)target,
-                                     available_size,
+    // Write the jump instruction
+    size_t written = arch_write_jump(detour_buf,
+                                     sizeof(detour_buf),
                                      (uintptr_t)target,
                                      (uintptr_t)destination);
 
     if (written == 0) {
-        patch__set_error("Failed to write detour jump");
+        patch__set_error("Failed to generate detour jump");
         return PATCH_ERR_INTERNAL;
     }
 
     // Fill remaining bytes with NOPs
 #ifdef PATCH_ARCH_X86_64
-    for (size_t i = written; i < available_size; i++) {
-        ((uint8_t *)target)[i] = 0x90;  // NOP
+    for (size_t i = written; i < available_size && i < sizeof(detour_buf); i++) {
+        detour_buf[i] = 0x90;  // NOP
     }
 #endif
 #ifdef PATCH_ARCH_ARM64
-    for (size_t i = written; i < available_size; i += 4) {
+    for (size_t i = written; i < available_size && i < sizeof(detour_buf); i += 4) {
         uint32_t nop = 0xD503201F;
-        memcpy((uint8_t *)target + i, &nop, 4);
+        memcpy(detour_buf + i, &nop, 4);
     }
 #endif
 
-    // Restore execute permission
-    err = platform_protect(page, region_size, MEM_PROT_RX);
+    // Use platform-specific code writing (handles memory protection)
+    patch_error_t err = platform_write_code(target, detour_buf, available_size);
     if (err != PATCH_SUCCESS) {
-        // Non-fatal, but log it
-        patch__set_error("Warning: failed to restore RX permission");
+        patch__set_error("Failed to write detour to target");
+        return err;
     }
-
-    platform_flush_icache(target, available_size);
 
     return PATCH_SUCCESS;
 }
@@ -146,31 +130,12 @@ patch__write_detour(void *target, void *destination, size_t available_size)
 patch_error_t
 patch__restore_bytes(void *target, const uint8_t *original, size_t size)
 {
-    void  *page      = platform_page_align(target);
-    size_t page_size = platform_page_size();
-    size_t offset    = (uintptr_t)target - (uintptr_t)page;
-    size_t region_size = offset + size;
-    if (region_size > page_size) {
-        region_size = ((region_size + page_size - 1) / page_size) * page_size;
-    }
-    else {
-        region_size = page_size;
-    }
-
-    patch_error_t err = platform_protect(page, region_size, MEM_PROT_RWX);
+    // Use platform-specific code writing (handles memory protection)
+    patch_error_t err = platform_write_code(target, original, size);
     if (err != PATCH_SUCCESS) {
-        patch__set_error("Failed to make target writable for restore");
+        patch__set_error("Failed to restore original bytes");
         return err;
     }
-
-    memcpy(target, original, size);
-
-    err = platform_protect(page, region_size, MEM_PROT_RX);
-    if (err != PATCH_SUCCESS) {
-        patch__set_error("Warning: failed to restore RX permission");
-    }
-
-    platform_flush_icache(target, size);
 
     return PATCH_SUCCESS;
 }

@@ -169,3 +169,29 @@ platform_page_align(void *addr)
     uintptr_t a  = (uintptr_t)addr;
     return (void *)(a & ~(ps - 1));
 }
+
+patch_error_t
+platform_write_code(void *addr, const void *data, size_t size)
+{
+    // On Linux, we can use mprotect to make code writable
+    void  *page      = platform_page_align(addr);
+    size_t ps        = platform_page_size();
+    size_t offset    = (uintptr_t)addr - (uintptr_t)page;
+    size_t region_size = ((offset + size + ps - 1) / ps) * ps;
+
+    // Make writable
+    if (mprotect(page, region_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return PATCH_ERR_MEMORY_PROTECTION;
+    }
+
+    // Write the data
+    memcpy(addr, data, size);
+
+    // Restore to RX
+    mprotect(page, region_size, PROT_READ | PROT_EXEC);
+
+    // Flush icache on ARM64
+    platform_flush_icache(addr, size);
+
+    return PATCH_SUCCESS;
+}
