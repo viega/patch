@@ -80,7 +80,7 @@ typedef enum {
     /** Current CPU architecture is not supported. */
     PATCH_ERR_UNSUPPORTED_ARCH,
 
-    /** Invalid argument passed to function (e.g., NULL pointer). */
+    /** Invalid argument passed to function (e.g., nullptr). */
     PATCH_ERR_INVALID_ARGUMENT,
 
     /** Internal error (bug in the library). */
@@ -141,7 +141,7 @@ typedef void (*patch_epilogue_fn)(patch_context_t *ctx, void *user_data);
  * @brief Configuration for installing a patch.
  *
  * Specifies the target function and optional callbacks. At least one of
- * prologue or epilogue should be non-NULL for the patch to be useful.
+ * prologue or epilogue should be non-null for the patch to be useful.
  *
  * @code
  * patch_config_t config = {
@@ -155,10 +155,10 @@ typedef struct {
     /** Target function to patch. Must point to the start of the function. */
     void *target;
 
-    /** Callback invoked before the original function (may be NULL). */
+    /** Callback invoked before the original function (may be nullptr). */
     patch_prologue_fn prologue;
 
-    /** Callback invoked after the original function (may be NULL). */
+    /** Callback invoked after the original function (may be nullptr). */
     patch_epilogue_fn epilogue;
 
     /** User data passed to prologue callback. */
@@ -179,7 +179,7 @@ typedef struct {
  *
  * @return PATCH_SUCCESS if the function can be patched,
  *         PATCH_ERR_PATTERN_UNRECOGNIZED if the prologue is not recognized,
- *         PATCH_ERR_INVALID_ARGUMENT if target is NULL.
+ *         PATCH_ERR_INVALID_ARGUMENT if target is nullptr.
  *
  * @note On macOS ARM64, this may return PATCH_ERR_MEMORY_PROTECTION even
  *       for valid functions due to hardware restrictions. Use the
@@ -198,7 +198,7 @@ typedef struct {
  * @param handle Output parameter receiving the patch handle.
  *
  * @return PATCH_SUCCESS on success, or an error code on failure.
- *         On failure, *handle is set to NULL.
+ *         On failure, *handle is set to nullptr.
  *
  * @note The target function must have been compiled with
  *       patchable_function_entry(8, 4) or have a recognized prologue.
@@ -218,7 +218,7 @@ typedef struct {
  * @param handle Handle returned by patch_install().
  *
  * @return PATCH_SUCCESS on success,
- *         PATCH_ERR_INVALID_ARGUMENT if handle is NULL.
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr.
  */
 patch_error_t patch_remove(patch_handle_t *handle);
 
@@ -233,7 +233,7 @@ patch_error_t patch_remove(patch_handle_t *handle);
  *
  * @return PATCH_SUCCESS on success,
  *         PATCH_ERR_NOT_PATCHED if already disabled,
- *         PATCH_ERR_INVALID_ARGUMENT if handle is NULL.
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr.
  *
  * @see patch_enable()
  */
@@ -246,7 +246,7 @@ patch_error_t patch_disable(patch_handle_t *handle);
  *
  * @return PATCH_SUCCESS on success,
  *         PATCH_ERR_ALREADY_PATCHED if already enabled,
- *         PATCH_ERR_INVALID_ARGUMENT if handle is NULL.
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr.
  *
  * @see patch_disable()
  */
@@ -276,7 +276,7 @@ patch_error_t patch_enable(patch_handle_t *handle);
  * @param ctx   Context passed to the callback.
  * @param index Zero-based argument index.
  *
- * @return Pointer to argument storage, or NULL if index is out of range.
+ * @return Pointer to argument storage, or nullptr if index is out of range.
  *
  * @code
  * bool my_prologue(patch_context_t *ctx, void *user_data) {
@@ -304,8 +304,7 @@ patch_error_t patch_enable(patch_handle_t *handle);
  *
  * @return true on success, false if index is out of range or size is invalid.
  */
-bool patch_context_set_arg(patch_context_t *ctx, size_t index,
-                           const void *value, size_t size);
+bool patch_context_set_arg(patch_context_t *ctx, size_t index, const void *value, size_t size);
 
 /**
  * @brief Get the function's return value.
@@ -346,7 +345,8 @@ bool patch_context_set_arg(patch_context_t *ctx, size_t index,
  * @endcode
  */
 void patch_context_set_return(patch_context_t *ctx,
-                              const void *value, size_t size);
+                              const void      *value,
+                              size_t           size);
 
 /**
  * @brief Get a callable pointer to the original function.

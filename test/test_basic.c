@@ -116,11 +116,11 @@ test_multiple_hooks(void)
 
     int r1 = PATCH_CALL(add_numbers, 5, 5);
     printf("  add_numbers(5, 5) = %d (expected 110)\n", r1);
-    assert(r1 == 110);  // (5+5) + 100
+    assert(r1 == 110); // (5+5) + 100
 
     int r2 = PATCH_CALL(multiply, 3, 4);
     printf("  multiply(3, 4) = %d (expected 24)\n", r2);
-    assert(r2 == 24);  // (3*4) * 2
+    assert(r2 == 24); // (3*4) * 2
 
     // Remove both
     PATCH_HOOK_REMOVE(add_numbers);
@@ -146,7 +146,7 @@ test_hook_method_selection(void)
 
     int result = PATCH_CALL(add_numbers, 7, 8);
     printf("  With PATCH_METHOD_POINTER: add_numbers(7, 8) = %d\n", result);
-    assert(result == 115);  // (7+8) + 100
+    assert(result == 115); // (7+8) + 100
 
     PATCH_HOOK_REMOVE(add_numbers);
 

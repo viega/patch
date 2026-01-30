@@ -36,28 +36,16 @@ patch_get_error_details(void)
 // 5. After trampoline returns, calls epilogue callback
 // 6. Returns to caller
 
-// For simplicity in this initial implementation, we'll use a different approach:
-// We insert a call to a dispatcher function that handles everything in C.
-
-// The hook entry point - this is what gets called when the patched function runs
-typedef struct {
-    patch_handle_t *handle;
-    void           *return_address;
-} hook_frame_t;
-
-// This structure is placed at a known location relative to the trampoline
-// so the dispatcher can find it.
-
 static void
 ensure_initialized(void)
 {
     static bool initialized = false;
     if (!initialized) {
-        bool ok = pattern_init_defaults();
         initialized = true;
-        if (!ok) {
+        if (!pattern_init_defaults()) {
             // This should never happen - patterns are compiled in.
-            // If it does, patch_can_install will return PATTERN_UNRECOGNIZED.
+            // Log for debugging but continue - patch_can_install will fail gracefully.
+            patch__set_error("pattern initialization failed (no handlers registered)");
         }
     }
 }
@@ -73,7 +61,7 @@ patch_can_install(void *target)
     }
 
     // Try to read from target to ensure it's accessible
-    mem_prot_t prot;
+    mem_prot_t    prot;
     patch_error_t err = platform_get_protection(target, &prot);
     if (err != PATCH_SUCCESS) {
         patch__set_error("Cannot determine protection of target address");
@@ -94,7 +82,8 @@ patch_can_install(void *target)
 
     if (match.prologue_size < match.min_patch_size) {
         patch__set_error("Prologue too small: %zu bytes, need %zu",
-                        match.prologue_size, match.min_patch_size);
+                         match.prologue_size,
+                         match.min_patch_size);
         return PATCH_ERR_INSUFFICIENT_SPACE;
     }
 
@@ -123,7 +112,8 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
 
     // Match prologue pattern
     pattern_match_t match = pattern_match_prologue(
-        (const uint8_t *)config->target, 64);
+        (const uint8_t *)config->target,
+        64);
 
     if (!match.matched) {
         patch__set_error("No recognized prologue pattern at target");
@@ -155,29 +145,27 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         return err;
     }
 
-    // Create trampoline
-    err = patch__trampoline_create(config->target, match.prologue_size,
-                                   &h->trampoline);
+    // Create trampoline (holds relocated prologue + jump back to original)
+    err = patch__trampoline_create(config->target, match.prologue_size, &h->trampoline);
     if (err != PATCH_SUCCESS) {
         free(h);
         return err;
     }
 
-    // For this initial implementation, we use a simple approach:
-    // The trampoline contains the relocated prologue + jump back.
-    // We create a small dispatcher stub that:
-    // 1. Saves state
-    // 2. Calls our hook handler
-    // 3. Based on result, jumps to trampoline or returns
+    // Create dispatcher (invokes callbacks, calls trampoline, returns result)
+    err = patch__dispatcher_create(h, &h->dispatcher);
+    if (err != PATCH_SUCCESS) {
+        patch__trampoline_destroy(h->trampoline);
+        free(h);
+        return err;
+    }
 
-    // For now, we'll use a simpler approach: just redirect to trampoline
-    // and let the caller call original via patch_context_get_original()
-
-    // Write the detour at the original function
+    // Write the detour at the original function - points to dispatcher
     err = patch__write_detour(config->target,
-                              h->trampoline->code,
+                              h->dispatcher,
                               match.prologue_size);
     if (err != PATCH_SUCCESS) {
+        patch__dispatcher_destroy(h->dispatcher);
         patch__trampoline_destroy(h->trampoline);
         free(h);
         return err;
@@ -203,7 +191,8 @@ patch_remove(patch_handle_t *handle)
         return err;
     }
 
-    // Free trampoline
+    // Free dispatcher and trampoline
+    patch__dispatcher_destroy(handle->dispatcher);
     patch__trampoline_destroy(handle->trampoline);
 
     // Free handle
@@ -220,8 +209,10 @@ patch_disable(patch_handle_t *handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
+    // Idempotent: calling disable on an already-disabled patch succeeds silently.
+    // This simplifies caller logic and matches common expectations.
     if (!atomic_load(&handle->enabled)) {
-        return PATCH_SUCCESS;  // Already disabled
+        return PATCH_SUCCESS;
     }
 
     // Restore original bytes
@@ -244,13 +235,15 @@ patch_enable(patch_handle_t *handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
+    // Idempotent: calling enable on an already-enabled patch succeeds silently.
+    // This simplifies caller logic and matches common expectations.
     if (atomic_load(&handle->enabled)) {
-        return PATCH_SUCCESS;  // Already enabled
+        return PATCH_SUCCESS;
     }
 
-    // Re-write the detour
+    // Re-write the detour (points to dispatcher)
     patch_error_t err = patch__write_detour(handle->target,
-                                            handle->trampoline->code,
+                                            handle->dispatcher,
                                             handle->patch_size);
     if (err != PATCH_SUCCESS) {
         return err;
@@ -272,8 +265,7 @@ patch_context_get_arg(patch_context_t *ctx, size_t index)
 }
 
 bool
-patch_context_set_arg(patch_context_t *ctx, size_t index,
-                      const void *value, size_t size)
+patch_context_set_arg(patch_context_t *ctx, size_t index, const void *value, size_t size)
 {
     if (ctx == nullptr || index >= PATCH_REG_ARGS || value == nullptr) {
         return false;

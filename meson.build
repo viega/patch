@@ -38,6 +38,7 @@ inc = include_directories('include', 'src')
 lib_sources = [
     'src/patch.c',
     'src/trampoline.c',
+    'src/dispatcher.c',
     'src/pattern/registry.c',
 ] + arch_sources + pattern_sources + platform_sources
 
@@ -68,4 +69,19 @@ test_basic = executable('test_basic',
     link_with: patch_lib,
 )
 
+test_hooks = executable('test_hooks',
+    'test/test_hooks.c',
+    include_directories: inc,
+    link_with: patch_lib,
+)
+
+test_realworld = executable('test_realworld',
+    'test/test_realworld.c',
+    include_directories: inc,
+    link_with: patch_lib,
+    dependencies: [cc.find_library('dl', required: false)],
+)
+
 test('basic', test_basic)
+test('hooks', test_hooks)
+test('realworld', test_realworld)

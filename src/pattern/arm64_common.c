@@ -8,8 +8,7 @@
 static inline uint32_t
 read_insn(const uint8_t *code)
 {
-    return (uint32_t)code[0] | ((uint32_t)code[1] << 8) |
-           ((uint32_t)code[2] << 16) | ((uint32_t)code[3] << 24);
+    return (uint32_t)code[0] | ((uint32_t)code[1] << 8) | ((uint32_t)code[2] << 16) | ((uint32_t)code[3] << 24);
 }
 
 // Check if instruction is STP with pre-decrement (frame setup)
@@ -65,8 +64,8 @@ static inline bool
 is_stp_callee_saved(uint32_t insn)
 {
     // STP with x19-x28 or d8-d15
-    if ((insn & 0x7FC00000) != 0x29000000 &&  // STP signed offset
-        (insn & 0x7FC00000) != 0x29800000) {  // STP pre-index
+    if ((insn & 0x7FC00000) != 0x29000000 && // STP signed offset
+        (insn & 0x7FC00000) != 0x29800000) { // STP pre-index
         return false;
     }
     uint32_t rt = insn & 0x1F;
@@ -113,7 +112,7 @@ match_frame_setup(const uint8_t *code, size_t avail, pattern_match_t *out)
     out->matched         = true;
     out->pattern_name    = "arm64_frame_setup";
     out->prologue_size   = offset;
-    out->min_patch_size  = 4;  // Single branch
+    out->min_patch_size  = 4; // Single branch
     out->has_pc_relative = false;
 
     return true;
@@ -167,8 +166,7 @@ match_bti(const uint8_t *code, size_t avail, pattern_match_t *out)
 
     // Try to match rest as frame_setup or PAC
     pattern_match_t sub = {0};
-    if (match_pac(code + 4, avail - 4, &sub) ||
-        match_frame_setup(code + 4, avail - 4, &sub)) {
+    if (match_pac(code + 4, avail - 4, &sub) || match_frame_setup(code + 4, avail - 4, &sub)) {
         out->matched         = true;
         out->pattern_name    = "arm64_bti_prologue";
         out->prologue_size   = 4 + sub.prologue_size;
@@ -260,7 +258,7 @@ match_patchable_entry(const uint8_t *code, size_t avail, pattern_match_t *out)
 
     while (offset + 4 <= avail) {
         uint32_t insn = read_insn(code + offset);
-        if (insn == 0xD503201F) {  // NOP
+        if (insn == 0xD503201F) { // NOP
             nop_count++;
             offset += 4;
         }
@@ -269,16 +267,19 @@ match_patchable_entry(const uint8_t *code, size_t avail, pattern_match_t *out)
         }
     }
 
-    // Need at least 4 NOPs (16 bytes) to be useful for patching
-    // This gives us room for: ldr x16, [pc, #8]; br x16; .quad addr
-    if (nop_count < 4) {
+    // Need at least 2 NOPs (8 bytes) to be recognized as a patchable entry.
+    // This distinguishes intentionally patchable functions (using the
+    // patchable_function_entry attribute) from functions that happen to
+    // start with a single NOP (common in optimized code for alignment).
+    // With 8 bytes, we have room for a B instruction (4 bytes) plus margin.
+    if (nop_count < 2) {
         return false;
     }
 
     out->matched         = true;
     out->pattern_name    = "arm64_patchable_entry";
     out->prologue_size   = offset;
-    out->min_patch_size  = 4;
+    out->min_patch_size  = 4; // Minimum for B instruction
     out->has_pc_relative = false;
 
     return true;
@@ -287,7 +288,7 @@ match_patchable_entry(const uint8_t *code, size_t avail, pattern_match_t *out)
 static pattern_handler_t handler_patchable = {
     .name        = "arm64_patchable_entry",
     .description = "Patchable function entry: NOP sled from patchable_function_entry attribute",
-    .priority    = 150,  // Highest priority - explicit opt-in
+    .priority    = 150, // Highest priority - explicit opt-in
     .match       = match_patchable_entry,
 };
 
@@ -295,7 +296,9 @@ void
 pattern_init_arm64(void)
 {
     static bool initialized = false;
-    if (initialized) return;
+    if (initialized) {
+        return;
+    }
     initialized = true;
 
     pattern_register(&handler_patchable);
@@ -305,4 +308,4 @@ pattern_init_arm64(void)
     pattern_register(&handler_leaf);
 }
 
-#endif  // PATCH_ARCH_ARM64
+#endif // PATCH_ARCH_ARM64

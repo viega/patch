@@ -19,7 +19,7 @@ typedef struct pattern_handler pattern_handler_t;
 struct pattern_handler {
     const char *name;
     const char *description;
-    int         priority;  // Higher = try first
+    int         priority; // Higher = try first
 
     bool (*match)(const uint8_t *code, size_t avail, pattern_match_t *out);
 

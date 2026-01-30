@@ -116,9 +116,9 @@
 // Implementation detail - do not use directly.
 
 #define PATCH__NARG_(_1, _2, _3, N, ...) N
-#define PATCH__NARG(...) PATCH__NARG_(__VA_ARGS__, 3, 2, 1)
-#define PATCH__CAT_(a, b) a##b
-#define PATCH__CAT(a, b) PATCH__CAT_(a, b)
+#define PATCH__NARG(...)                 PATCH__NARG_(__VA_ARGS__, 3, 2, 1)
+#define PATCH__CAT_(a, b)                a##b
+#define PATCH__CAT(a, b)                 PATCH__CAT_(a, b)
 #define PATCH__INSTALL_DISPATCH(...) \
     PATCH__CAT(PATCH__HOOK_INSTALL, PATCH__NARG(__VA_ARGS__))(__VA_ARGS__)
 
@@ -184,10 +184,10 @@
  * }
  * @endcode
  */
-#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                 \
-    ret name##_impl(__VA_ARGS__);                             \
-    ret (*name##_ptr)(__VA_ARGS__) = name##_impl;             \
-    static ret (*name##__saved_ptr)(__VA_ARGS__) = nullptr;   \
+#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                   \
+    ret name##_impl(__VA_ARGS__);                               \
+    ret (*name##_ptr)(__VA_ARGS__)               = name##_impl; \
+    static ret (*name##__saved_ptr)(__VA_ARGS__) = nullptr;     \
     ret name##_impl(__VA_ARGS__)
 
 /**
@@ -272,12 +272,12 @@
  * PATCH_HOOK_REMOVE(add);
  * @endcode
  */
-#define PATCH_HOOK_REMOVE(name)               \
-    do {                                      \
-        if (name##__saved_ptr) {              \
+#define PATCH_HOOK_REMOVE(name)                    \
+    do {                                           \
+        if (name##__saved_ptr) {                   \
             name##_ptr        = name##__saved_ptr; \
-            name##__saved_ptr = nullptr;      \
-        }                                     \
+            name##__saved_ptr = nullptr;           \
+        }                                          \
     } while (0)
 
 /**
@@ -331,10 +331,19 @@
  * jump instruction for code patching.
  *
  * Format: patchable_function_entry(total_nops, nops_before_entry)
- * - total_nops: Total NOP bytes to insert (8 = 2 ARM64 NOPs or 8 x86 NOPs)
- * - nops_before_entry: NOPs before the entry point label (4 = 1 ARM64 NOP)
+ *
+ * Architecture requirements:
+ * - x86-64: Need 5+ bytes at entry for JMP rel32
+ * - ARM64: Need 8+ bytes at entry (2 NOPs) to clearly distinguish from
+ *          functions that happen to start with a single NOP
  */
-#define PATCH_PATCHABLE __attribute__((patchable_function_entry(8, 4)))
+#ifdef PATCH_ARCH_X86_64
+// x86-64: 16 single-byte NOPs total, 8 before entry = 8 at entry
+#define PATCH_PATCHABLE __attribute__((patchable_function_entry(16, 8)))
+#else
+// ARM64: 4 four-byte NOPs total, 2 before entry = 2 at entry (8 bytes)
+#define PATCH_PATCHABLE __attribute__((patchable_function_entry(4, 2)))
+#endif
 
 /**
  * @brief Declare a hookable function (for use in headers).
@@ -359,12 +368,12 @@
  * @param name Function name (without quotes).
  * @param ...  Parameter list (types and names).
  */
-#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                              \
-    PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__);       \
-    ret (*name##_ptr)(__VA_ARGS__)                   = name;               \
-    static ret (*name##__saved_ptr)(__VA_ARGS__)     = nullptr;            \
-    static patch_handle_t *name##__patch_handle      = nullptr;            \
-    static int             name##__hook_method       = PATCH_METHOD_AUTO;  \
+#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                                               \
+    PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__);                        \
+    ret (*name##_ptr)(__VA_ARGS__)                                     = name;              \
+    static ret (*name##__saved_ptr)(__VA_ARGS__)                       = nullptr;           \
+    static patch_handle_t                        *name##__patch_handle = nullptr;           \
+    static int                                    name##__hook_method  = PATCH_METHOD_AUTO; \
     PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__)
 
 /**
@@ -374,7 +383,7 @@
  * @param ...  Arguments to pass to the function.
  * @return The function's return value.
  */
-#define PATCH_CALL(name, ...) name##_ptr(__VA_ARGS__)
+#define PATCH_CALL(name, ...)     name##_ptr(__VA_ARGS__)
 
 /**
  * @brief Get the original (unhooked) function.
@@ -385,23 +394,23 @@
 #define PATCH_HOOK_ORIGINAL(name) name
 
 // Internal: 2-argument version (uses default method)
-#define PATCH__HOOK_INSTALL2(name, hook)         \
-    patch__hook_install((void **)&name##_ptr,    \
-                        (void *)name,            \
-                        (void *)(hook),          \
+#define PATCH__HOOK_INSTALL2(name, hook)             \
+    patch__hook_install((void **)&name##_ptr,        \
+                        (void *)name,                \
+                        (void *)(hook),              \
                         (void **)&name##__saved_ptr, \
-                        &name##__patch_handle,   \
-                        &name##__hook_method,    \
+                        &name##__patch_handle,       \
+                        &name##__hook_method,        \
                         PATCH_METHOD_AUTO)
 
 // Internal: 3-argument version (explicit method)
-#define PATCH__HOOK_INSTALL3(name, hook, method) \
-    patch__hook_install((void **)&name##_ptr,    \
-                        (void *)name,            \
-                        (void *)(hook),          \
+#define PATCH__HOOK_INSTALL3(name, hook, method)     \
+    patch__hook_install((void **)&name##_ptr,        \
+                        (void *)name,                \
+                        (void *)(hook),              \
                         (void **)&name##__saved_ptr, \
-                        &name##__patch_handle,   \
-                        &name##__hook_method,    \
+                        &name##__patch_handle,       \
+                        &name##__hook_method,        \
                         (method))
 
 /**
@@ -418,11 +427,11 @@
  *
  * @param name Function name.
  */
-#define PATCH_HOOK_REMOVE(name)                  \
-    patch__hook_remove((void **)&name##_ptr,     \
-                       (void *)name,             \
+#define PATCH_HOOK_REMOVE(name)                     \
+    patch__hook_remove((void **)&name##_ptr,        \
+                       (void *)name,                \
                        (void **)&name##__saved_ptr, \
-                       &name##__patch_handle,    \
+                       &name##__patch_handle,       \
                        &name##__hook_method)
 
 /**

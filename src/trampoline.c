@@ -7,8 +7,7 @@
 #include <string.h>
 
 patch_error_t
-patch__trampoline_create(void *target, size_t prologue_size,
-                         patch__trampoline_t **out)
+patch__trampoline_create(void *target, size_t prologue_size, patch__trampoline_t **out)
 {
     patch__trampoline_t *tramp = calloc(1, sizeof(*tramp));
     if (tramp == nullptr) {
@@ -18,7 +17,7 @@ patch__trampoline_create(void *target, size_t prologue_size,
 
     // Allocate executable memory for the trampoline code
     void         *exec_mem = nullptr;
-    patch_error_t err = platform_alloc_near(target, PATCH_TRAMPOLINE_SIZE, &exec_mem);
+    patch_error_t err      = platform_alloc_near(target, PATCH_TRAMPOLINE_SIZE, &exec_mem);
     if (err != PATCH_SUCCESS) {
         free(tramp);
         patch__set_error("Failed to allocate executable memory for trampoline");
@@ -45,10 +44,10 @@ patch__trampoline_create(void *target, size_t prologue_size,
 
     // Write jump back to original function after prologue
     uintptr_t resume_addr = (uintptr_t)target + prologue_size;
-    size_t    jump_size = arch_write_jump(tramp->code + relocated,
-                                          PATCH_TRAMPOLINE_SIZE - relocated,
-                                          (uintptr_t)tramp->code + relocated,
-                                          resume_addr);
+    size_t    jump_size   = arch_write_jump(tramp->code + relocated,
+                                            PATCH_TRAMPOLINE_SIZE - relocated,
+                                            (uintptr_t)tramp->code + relocated,
+                                            resume_addr);
 
     if (jump_size == 0) {
         platform_free_exec(tramp->code, tramp->alloc_size);
@@ -60,9 +59,9 @@ patch__trampoline_create(void *target, size_t prologue_size,
     // Flush instruction cache
     platform_flush_icache(tramp->code, relocated + jump_size);
 
-    tramp->code_len        = relocated + jump_size;
-    tramp->original_target = target;
-    tramp->relocated_bytes = prologue_size;
+    tramp->code_len              = relocated + jump_size;
+    tramp->original_target       = target;
+    tramp->original_prologue_len = prologue_size;
 
     *out = tramp;
     return PATCH_SUCCESS;
@@ -71,7 +70,9 @@ patch__trampoline_create(void *target, size_t prologue_size,
 void
 patch__trampoline_destroy(patch__trampoline_t *tramp)
 {
-    if (tramp == nullptr) return;
+    if (tramp == nullptr) {
+        return;
+    }
 
     if (tramp->code != nullptr) {
         platform_free_exec(tramp->code, tramp->alloc_size);
@@ -85,7 +86,8 @@ patch__write_detour(void *target, void *destination, size_t available_size)
     size_t min_size = arch_min_prologue_size();
     if (available_size < min_size) {
         patch__set_error("Insufficient space for detour: need %zu bytes, have %zu",
-                        min_size, available_size);
+                         min_size,
+                         available_size);
         return PATCH_ERR_INSUFFICIENT_SPACE;
     }
 
@@ -107,7 +109,7 @@ patch__write_detour(void *target, void *destination, size_t available_size)
     // Fill remaining bytes with NOPs
 #ifdef PATCH_ARCH_X86_64
     for (size_t i = written; i < available_size && i < sizeof(detour_buf); i++) {
-        detour_buf[i] = 0x90;  // NOP
+        detour_buf[i] = 0x90; // NOP
     }
 #endif
 #ifdef PATCH_ARCH_ARM64
