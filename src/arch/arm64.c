@@ -37,8 +37,7 @@ arch_decode_insn(const uint8_t *code, size_t avail, arch_insn_t *out)
 {
     if (avail < 4) return 0;
 
-    memset(out, 0, sizeof(*out));
-    out->length = 4;  // All ARM64 instructions are 4 bytes
+    *out = (arch_insn_t){.length = 4};  // All ARM64 instructions are 4 bytes
 
     uint32_t insn = read_insn(code);
 
@@ -342,17 +341,6 @@ arch_write_jump(uint8_t *dst, size_t dst_avail,
     memcpy(dst + 8, &dst_addr, 8);
 
     return 16;
-}
-
-size_t
-arch_write_dispatcher(uint8_t *dst, size_t dst_avail,
-                      void *handler, void *handle)
-{
-    (void)dst;
-    (void)dst_avail;
-    (void)handler;
-    (void)handle;
-    return 0;  // Implemented in trampoline.c
 }
 
 size_t

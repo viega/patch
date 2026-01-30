@@ -32,8 +32,12 @@ void pattern_register(pattern_handler_t *handler);
 // Try to match prologue against all registered patterns
 pattern_match_t pattern_match_prologue(const uint8_t *code, size_t avail);
 
-// Initialize default patterns for current architecture
-void pattern_init_defaults(void);
+// Initialize default patterns for current architecture.
+// Returns true if at least one pattern was registered.
+bool pattern_init_defaults(void);
+
+// Check if any patterns are registered
+bool pattern_has_handlers(void);
 
 // Architecture-specific pattern initialization
 void pattern_init_x86_64(void);

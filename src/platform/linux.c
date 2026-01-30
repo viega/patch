@@ -1,6 +1,7 @@
 #include "platform.h"
 
 #include "patch/patch_arch.h"
+#include "../patch_internal.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -46,6 +47,7 @@ platform_get_protection(void *addr, mem_prot_t *out_prot)
 {
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) {
+        patch__set_error("Failed to open /proc/self/maps");
         return PATCH_ERR_INTERNAL;
     }
 
@@ -87,6 +89,7 @@ platform_get_protection(void *addr, mem_prot_t *out_prot)
     }
 
     fclose(fp);
+    patch__set_error("Address %p not found in /proc/self/maps", addr);
     return PATCH_ERR_INTERNAL;
 }
 
@@ -97,12 +100,45 @@ platform_alloc_near(void *target, size_t size, void **out)
     size_t aligned_size = ((size + ps - 1) / ps) * ps;
 
 #ifdef PATCH_ARCH_X86_64
-    // Try to allocate within 2GB of target for rel32 jumps
+    // Try to allocate within 2GB of target for rel32 jumps.
+    // Use exponentially increasing step sizes to avoid iterating through
+    // billions of addresses on systems with large address spaces.
     uintptr_t base  = (uintptr_t)target;
     uintptr_t start = (base > 0x7FFFFFFF) ? (base - 0x7FFFFFFF) : ps;
     uintptr_t end   = base + 0x7FFFFFFF;
 
-    for (uintptr_t addr = start; addr < end; addr += ps) {
+    // Try a few strategic locations first: near target, then spread out
+    uintptr_t hints[] = {
+        base - ps,                    // Just before target
+        base + 0x1000,                // Just after target
+        base - 0x10000,               // 64KB before
+        base + 0x10000,               // 64KB after
+        base - 0x100000,              // 1MB before
+        base + 0x100000,              // 1MB after
+        base - 0x1000000,             // 16MB before
+        base + 0x1000000,             // 16MB after
+        base - 0x10000000,            // 256MB before
+        base + 0x10000000,            // 256MB after
+    };
+
+    for (size_t i = 0; i < sizeof(hints) / sizeof(hints[0]); i++) {
+        uintptr_t addr = hints[i] & ~(ps - 1);  // Page-align
+        if (addr < start || addr >= end) continue;
+
+        void *p = mmap((void *)addr,
+                       aligned_size,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                       -1,
+                       0);
+        if (p != MAP_FAILED) {
+            *out = p;
+            return PATCH_SUCCESS;
+        }
+    }
+
+    // If hints failed, do a sparse search with large steps (1MB)
+    for (uintptr_t addr = start; addr < end; addr += 0x100000) {
         void *p = mmap((void *)addr,
                        aligned_size,
                        PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -151,6 +187,11 @@ platform_flush_icache(void *addr, size_t size)
     (void)size;
 #endif
 }
+
+// Note: platform_page_size() and platform_page_align() are duplicated in
+// darwin.c intentionally. Keeping them in platform-specific files allows
+// each platform to potentially use different implementations if needed,
+// and keeps the platform abstraction clean.
 
 size_t
 platform_page_size(void)

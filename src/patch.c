@@ -53,8 +53,12 @@ ensure_initialized(void)
 {
     static bool initialized = false;
     if (!initialized) {
-        pattern_init_defaults();
+        bool ok = pattern_init_defaults();
         initialized = true;
+        if (!ok) {
+            // This should never happen - patterns are compiled in.
+            // If it does, patch_can_install will return PATTERN_UNRECOGNIZED.
+        }
     }
 }
 
@@ -64,7 +68,7 @@ patch_can_install(void *target)
     ensure_initialized();
 
     if (target == nullptr) {
-        patch__set_error("Target is null");
+        patch__set_error("target is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -103,12 +107,12 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     ensure_initialized();
 
     if (config == nullptr || handle == nullptr) {
-        patch__set_error("Invalid arguments");
+        patch__set_error("config or handle is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
     if (config->target == nullptr) {
-        patch__set_error("Target is null");
+        patch__set_error("config->target is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -187,7 +191,7 @@ patch_error_t
 patch_remove(patch_handle_t *handle)
 {
     if (handle == nullptr) {
-        patch__set_error("Handle is null");
+        patch__set_error("handle is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -212,7 +216,7 @@ patch_error_t
 patch_disable(patch_handle_t *handle)
 {
     if (handle == nullptr) {
-        patch__set_error("Handle is null");
+        patch__set_error("handle is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -236,7 +240,7 @@ patch_error_t
 patch_enable(patch_handle_t *handle)
 {
     if (handle == nullptr) {
-        patch__set_error("Handle is null");
+        patch__set_error("handle is null");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 

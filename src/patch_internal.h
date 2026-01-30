@@ -8,7 +8,8 @@
 #include <stdint.h>
 #include <string.h>
 
-// Thread-local error details buffer
+// Thread-local error details buffer.
+// 256 bytes is sufficient for all error messages (longest is ~100 chars).
 #define PATCH_ERROR_BUFFER_SIZE 256
 
 // Set error details for current thread

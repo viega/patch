@@ -7,7 +7,13 @@
 
 static pattern_handler_t *g_handlers = nullptr;
 
-void
+bool
+pattern_has_handlers(void)
+{
+    return g_handlers != nullptr;
+}
+
+bool
 pattern_init_defaults(void)
 {
 #ifdef PATCH_ARCH_X86_64
@@ -16,6 +22,7 @@ pattern_init_defaults(void)
 #ifdef PATCH_ARCH_ARM64
     pattern_init_arm64();
 #endif
+    return g_handlers != nullptr;
 }
 
 static int

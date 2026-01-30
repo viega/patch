@@ -77,7 +77,7 @@ arch_decode_insn(const uint8_t *code, size_t avail, arch_insn_t *out)
 {
     if (avail == 0) return 0;
 
-    memset(out, 0, sizeof(*out));
+    *out = (arch_insn_t){0};
 
     size_t pos = 0;
 
@@ -404,27 +404,6 @@ arch_write_jump(uint8_t *dst, size_t dst_avail,
     dst[12] = 0xE3;  // ModRM: r11
 
     return 13;
-}
-
-size_t
-arch_write_dispatcher(uint8_t *dst, size_t dst_avail,
-                      void *handler, void *handle)
-{
-    // Write code that:
-    // 1. Saves all argument registers (for inspection)
-    // 2. Calls our handler with the handle pointer
-    // 3. Based on return, either proceeds or returns
-
-    // For now, simple dispatcher:
-    // push all args, call handler(handle), pop all, check result
-    // This is complex - defer to trampoline.c for full implementation
-
-    (void)dst;
-    (void)dst_avail;
-    (void)handler;
-    (void)handle;
-
-    return 0;  // Implemented in trampoline.c
 }
 
 size_t

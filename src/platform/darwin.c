@@ -244,6 +244,11 @@ platform_flush_icache(void *addr, size_t size)
 #endif
 }
 
+// Note: platform_page_size() and platform_page_align() are duplicated in
+// linux.c intentionally. Keeping them in platform-specific files allows
+// each platform to potentially use different implementations if needed,
+// and keeps the platform abstraction clean.
+
 size_t
 platform_page_size(void)
 {

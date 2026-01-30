@@ -89,9 +89,9 @@ patch__write_detour(void *target, void *destination, size_t available_size)
         return PATCH_ERR_INSUFFICIENT_SPACE;
     }
 
-    // Build the detour code in a temporary buffer
-    uint8_t detour_buf[32];
-    memset(detour_buf, 0, sizeof(detour_buf));
+    // Build the detour code in a temporary buffer.
+    // 32 bytes is sufficient: x86-64 needs max 13 bytes, ARM64 needs max 16 bytes.
+    uint8_t detour_buf[32] = {0};
 
     // Write the jump instruction
     size_t written = arch_write_jump(detour_buf,
