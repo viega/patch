@@ -1,5 +1,5 @@
 #include "patch/patch.h"
-#include "patch/patch_arch.h"
+#include "patch/patch_hook.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -7,45 +7,19 @@
 #include <string.h>
 
 // ============================================================================
-// Platform-specific hookable functions
+// Hookable functions using unified macros
 // ============================================================================
 
-#ifdef PATCH_PLATFORM_DARWIN
-// macOS: Use function pointer indirection
-// The actual implementation is in _impl, called through _ptr
-
-int add_numbers_impl(int a, int b) { return a + b; }
-int (*add_numbers_ptr)(int, int) = add_numbers_impl;
-
-static inline int add_numbers(int a, int b) {
-    return add_numbers_ptr(a, b);
-}
-
-int multiply_impl(int a, int b) { return a * b; }
-int (*multiply_ptr)(int, int) = multiply_impl;
-
-static inline int multiply(int a, int b) {
-    return multiply_ptr(a, b);
-}
-
-#else
-// Linux: Use patchable_function_entry for code patching
-
-#define PATCHABLE __attribute__((patchable_function_entry(8, 4)))
-
-PATCHABLE __attribute__((noinline)) int
-add_numbers(int a, int b)
+// Define hookable functions - works on both macOS and Linux
+PATCH_DEFINE_HOOKABLE(int, add_numbers, int a, int b)
 {
     return a + b;
 }
 
-PATCHABLE __attribute__((noinline)) int
-multiply(int a, int b)
+PATCH_DEFINE_HOOKABLE(int, multiply, int a, int b)
 {
     return a * b;
 }
-
-#endif
 
 // Non-patchable function for comparison
 __attribute__((noinline)) int
@@ -55,8 +29,134 @@ regular_add(int a, int b)
 }
 
 // ============================================================================
+// Hook functions
+// ============================================================================
+
+// Hook that adds 100 to the result
+static int
+hooked_add(int a, int b)
+{
+    printf("    [Hook intercepted: a=%d, b=%d]\n", a, b);
+    return PATCH_CALL_ORIGINAL(add_numbers, a, b) + 100;
+}
+
+// Hook that doubles the result
+static int
+hooked_multiply(int a, int b)
+{
+    printf("    [Multiply hook: a=%d, b=%d]\n", a, b);
+    return PATCH_CALL_ORIGINAL(multiply, a, b) * 2;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+static void
+test_basic_functions(void)
+{
+    printf("Testing basic function calls...\n");
+
+    int r1 = PATCH_CALL(add_numbers, 2, 3);
+    assert(r1 == 5);
+    printf("  add_numbers(2, 3) = %d\n", r1);
+
+    int r2 = PATCH_CALL(multiply, 4, 5);
+    assert(r2 == 20);
+    printf("  multiply(4, 5) = %d\n", r2);
+
+    int r3 = regular_add(6, 7);
+    assert(r3 == 13);
+    printf("  regular_add(6, 7) = %d\n", r3);
+
+    printf("  PASSED\n\n");
+}
+
+static void
+test_unified_hooks(void)
+{
+    printf("Testing unified hook interface...\n");
+
+    // Verify not hooked initially
+    assert(!PATCH_HOOK_IS_INSTALLED(add_numbers));
+    assert(!PATCH_HOOK_IS_INSTALLED(multiply));
+
+    // Test add_numbers hook
+    int result = PATCH_CALL(add_numbers, 10, 20);
+    printf("  Before hook: add_numbers(10, 20) = %d\n", result);
+    assert(result == 30);
+
+    // Install hook using unified macro
+    PATCH_HOOK_INSTALL(add_numbers, hooked_add);
+    assert(PATCH_HOOK_IS_INSTALLED(add_numbers));
+
+    result = PATCH_CALL(add_numbers, 10, 20);
+    printf("  With hook: add_numbers(10, 20) = %d (expected 130)\n", result);
+    assert(result == 130);
+
+    // Remove hook using unified macro
+    PATCH_HOOK_REMOVE(add_numbers);
+    assert(!PATCH_HOOK_IS_INSTALLED(add_numbers));
+
+    result = PATCH_CALL(add_numbers, 10, 20);
+    printf("  After remove: add_numbers(10, 20) = %d\n", result);
+    assert(result == 30);
+
+    printf("  PASSED\n\n");
+}
+
+static void
+test_multiple_hooks(void)
+{
+    printf("Testing multiple hooks...\n");
+
+    // Hook both functions
+    PATCH_HOOK_INSTALL(add_numbers, hooked_add);
+    PATCH_HOOK_INSTALL(multiply, hooked_multiply);
+
+    int r1 = PATCH_CALL(add_numbers, 5, 5);
+    printf("  add_numbers(5, 5) = %d (expected 110)\n", r1);
+    assert(r1 == 110);  // (5+5) + 100
+
+    int r2 = PATCH_CALL(multiply, 3, 4);
+    printf("  multiply(3, 4) = %d (expected 24)\n", r2);
+    assert(r2 == 24);  // (3*4) * 2
+
+    // Remove both
+    PATCH_HOOK_REMOVE(add_numbers);
+    PATCH_HOOK_REMOVE(multiply);
+
+    r1 = PATCH_CALL(add_numbers, 5, 5);
+    r2 = PATCH_CALL(multiply, 3, 4);
+    assert(r1 == 10);
+    assert(r2 == 12);
+    printf("  After remove: add=%d, multiply=%d\n", r1, r2);
+
+    printf("  PASSED\n\n");
+}
+
+#ifndef PATCH_PLATFORM_DARWIN
+static void
+test_hook_method_selection(void)
+{
+    printf("Testing hook method selection (Linux)...\n");
+
+    // Test pointer method explicitly
+    PATCH_HOOK_INSTALL(add_numbers, hooked_add, PATCH_METHOD_POINTER);
+
+    int result = PATCH_CALL(add_numbers, 7, 8);
+    printf("  With PATCH_METHOD_POINTER: add_numbers(7, 8) = %d\n", result);
+    assert(result == 115);  // (7+8) + 100
+
+    PATCH_HOOK_REMOVE(add_numbers);
+
+    result = PATCH_CALL(add_numbers, 7, 8);
+    assert(result == 15);
+    printf("  After remove: %d\n", result);
+
+    printf("  PASSED\n\n");
+}
+#endif
 
 static void
 test_can_install(void)
@@ -64,21 +164,13 @@ test_can_install(void)
     printf("Testing patch_can_install...\n");
 
 #ifndef PATCH_PLATFORM_DARWIN
+    // On Linux, we can check if code patching would work
     patch_error_t err = patch_can_install((void *)add_numbers);
     if (err == PATCH_SUCCESS) {
-        printf("  add_numbers: can install\n");
+        printf("  add_numbers: code patching available (NOP sled detected)\n");
     }
     else {
-        printf("  add_numbers: cannot install (%s)\n",
-               patch_get_error_details());
-    }
-
-    err = patch_can_install((void *)multiply);
-    if (err == PATCH_SUCCESS) {
-        printf("  multiply: can install\n");
-    }
-    else {
-        printf("  multiply: cannot install (%s)\n",
+        printf("  add_numbers: code patching unavailable (%s)\n",
                patch_get_error_details());
     }
 
@@ -87,10 +179,10 @@ test_can_install(void)
         printf("  regular_add: can install\n");
     }
     else {
-        printf("  regular_add: cannot install (expected)\n");
+        printf("  regular_add: cannot install (expected - no NOP sled)\n");
     }
 #else
-    printf("  [macOS] Code patching unavailable - use function pointers\n");
+    printf("  [macOS] Code patching unavailable - unified macros use pointers\n");
 #endif
 
     // Test nullptr rejection (works on all platforms)
@@ -99,48 +191,6 @@ test_can_install(void)
     printf("  nullptr: correctly rejected\n");
 
     printf("  PASSED\n\n");
-}
-
-#ifdef PATCH_PLATFORM_DARWIN
-// Hook function for macOS testing
-static int hooked_add(int a, int b)
-{
-    printf("    [Hook intercepted: a=%d, b=%d]\n", a, b);
-    return add_numbers_impl(a, b) + 100;  // Original + 100
-}
-#endif
-
-static void
-test_macos_hooks(void)
-{
-#ifdef PATCH_PLATFORM_DARWIN
-    printf("Testing macOS function pointer hooks...\n");
-
-    // Original behavior
-    int result = add_numbers(10, 20);
-    printf("  Before hook: add_numbers(10, 20) = %d\n", result);
-    assert(result == 30);
-
-    // Install hook by changing the function pointer
-    int (*original_ptr)(int, int) = add_numbers_ptr;
-    add_numbers_ptr = hooked_add;
-
-    result = add_numbers(10, 20);
-    printf("  With hook: add_numbers(10, 20) = %d (expected 130)\n", result);
-    assert(result == 130);
-
-    // Restore original
-    add_numbers_ptr = original_ptr;
-
-    result = add_numbers(10, 20);
-    printf("  After restore: add_numbers(10, 20) = %d\n", result);
-    assert(result == 30);
-
-    printf("  PASSED\n\n");
-#else
-    printf("Testing macOS function pointer hooks...\n");
-    printf("  Skipping (not on macOS)\n\n");
-#endif
 }
 
 #ifndef PATCH_PLATFORM_DARWIN
@@ -154,13 +204,11 @@ test_prologue(patch_context_t *ctx, void *user_data)
     g_prologue_called = true;
     return true;
 }
-#endif
 
 static void
-test_linux_code_patching(void)
+test_low_level_api(void)
 {
-#ifndef PATCH_PLATFORM_DARWIN
-    printf("Testing Linux code patching...\n");
+    printf("Testing low-level patch API (Linux)...\n");
 
     patch_error_t err = patch_can_install((void *)add_numbers);
     if (err != PATCH_SUCCESS) {
@@ -168,7 +216,7 @@ test_linux_code_patching(void)
         return;
     }
 
-    int result = add_numbers(5, 3);
+    int result = PATCH_CALL(add_numbers, 5, 3);
     assert(result == 8);
     printf("  Before hook: add_numbers(5, 3) = %d\n", result);
 
@@ -178,7 +226,7 @@ test_linux_code_patching(void)
     };
 
     patch_handle_t *handle = nullptr;
-    err = patch_install(&config, &handle);
+    err                    = patch_install(&config, &handle);
 
     if (err != PATCH_SUCCESS) {
         printf("  Install failed: %s\n", patch_get_error_details());
@@ -186,46 +234,23 @@ test_linux_code_patching(void)
         return;
     }
 
-    printf("  Hook installed\n");
+    printf("  Prologue hook installed via low-level API\n");
 
     g_prologue_called = false;
-    result = add_numbers(10, 20);
+    result            = PATCH_CALL(add_numbers, 10, 20);
     printf("  With hook: add_numbers(10, 20) = %d\n", result);
-    printf("  Function still works: %s\n", result == 30 ? "yes" : "no");
+    printf("  Prologue called: %s\n", g_prologue_called ? "yes" : "no");
 
     patch_remove(handle);
     printf("  Hook removed\n");
 
-    result = add_numbers(100, 200);
+    result = PATCH_CALL(add_numbers, 100, 200);
     assert(result == 300);
     printf("  After remove: add_numbers(100, 200) = %d\n", result);
 
     printf("  PASSED\n\n");
-#else
-    printf("Testing Linux code patching...\n");
-    printf("  Skipping (on macOS, use function pointers)\n\n");
+}
 #endif
-}
-
-static void
-test_basic_functions(void)
-{
-    printf("Testing basic function calls...\n");
-
-    int r1 = add_numbers(2, 3);
-    assert(r1 == 5);
-    printf("  add_numbers(2, 3) = %d\n", r1);
-
-    int r2 = multiply(4, 5);
-    assert(r2 == 20);
-    printf("  multiply(4, 5) = %d\n", r2);
-
-    int r3 = regular_add(6, 7);
-    assert(r3 == 13);
-    printf("  regular_add(6, 7) = %d\n", r3);
-
-    printf("  PASSED\n\n");
-}
 
 int
 main(void)
@@ -233,8 +258,7 @@ main(void)
     printf("=== patch library tests ===\n");
 #ifdef PATCH_PLATFORM_DARWIN
     printf("Platform: macOS ARM64\n");
-    printf("Note: Code patching blocked by hardware W^X.\n");
-    printf("      Using function pointer indirection for hooks.\n");
+    printf("Note: Hardware W^X - unified macros use pointer indirection.\n");
 #elif defined(PATCH_ARCH_ARM64)
     printf("Platform: Linux ARM64\n");
 #else
@@ -243,9 +267,15 @@ main(void)
     printf("\n");
 
     test_basic_functions();
+    test_unified_hooks();
+    test_multiple_hooks();
+
+#ifndef PATCH_PLATFORM_DARWIN
+    test_hook_method_selection();
+    test_low_level_api();
+#endif
+
     test_can_install();
-    test_macos_hooks();
-    test_linux_code_patching();
 
     printf("=== All tests completed ===\n");
     return 0;
