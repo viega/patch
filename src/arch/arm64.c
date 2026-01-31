@@ -413,6 +413,7 @@ is_stp_callee_saved(uint32_t insn)
 static bool match_frame_setup(const uint8_t *code, size_t avail, pattern_match_t *out);
 static bool match_frame_setup_alt(const uint8_t *code, size_t avail, pattern_match_t *out);
 static bool match_frame_setup_preindex_callee(const uint8_t *code, size_t avail, pattern_match_t *out);
+static bool match_no_frame_pointer(const uint8_t *code, size_t avail, pattern_match_t *out);
 
 // Pattern: Standard frame setup
 // stp x29, x30, [sp, #-N]!
@@ -615,6 +616,24 @@ is_stp_callee_saved_pre(uint32_t insn)
     return (rt >= 19 && rt <= 28) && (rn == 31);
 }
 
+// Check if instruction is STP with LR (x30) saved (common with -fomit-frame-pointer)
+// This includes patterns like: STP x30, x19, [sp, #-N]! where LR is rt and callee-saved is rt2
+static inline bool
+is_stp_lr_pre(uint32_t insn)
+{
+    // STP with pre-index: 1x10 1001 11ii iiii itttt tnnn nntt ttt1
+    if ((insn & 0xFFC00000) != 0xA9800000) {
+        return false;
+    }
+    uint32_t rt  = insn & 0x1F;
+    uint32_t rt2 = (insn >> 10) & 0x1F;
+    uint32_t rn  = (insn >> 5) & 0x1F;
+    // x30 (LR) in either position with callee-saved register, base must be sp
+    bool has_lr = (rt == 30 || rt2 == 30);
+    bool has_callee_saved = (rt >= 19 && rt <= 28) || (rt2 >= 19 && rt2 <= 28);
+    return has_lr && has_callee_saved && (rn == 31);
+}
+
 // Pattern: Alternative frame setup with explicit SUB then STP at offset
 // Source: Observed in glibc printf, macOS libSystem printf/sprintf/puts/fopen/etc.
 // Pattern variants:
@@ -768,6 +787,47 @@ is_cbz_cbnz(uint32_t insn)
     return (insn & 0x7E000000) == 0x34000000;
 }
 
+// Pattern: -fomit-frame-pointer prologue
+// Source: GCC/Clang with -fomit-frame-pointer on ARM64
+// Pattern: stp x30, xN, [sp, #-M]! or stp xN, x30, [sp, #-M]!
+// The function saves LR and callee-saved registers but doesn't set up x29 as frame pointer.
+// See PATTERNS.md for full documentation.
+static bool
+match_no_frame_pointer(const uint8_t *code, size_t avail, pattern_match_t *out)
+{
+    if (avail < 4) {
+        return false;
+    }
+
+    uint32_t insn0 = read_insn(code);
+
+    // First instruction: STP with LR (x30) pre-indexed
+    if (!is_stp_lr_pre(insn0)) {
+        return false;
+    }
+
+    size_t offset = 4;
+
+    // Look for additional callee-saved register saves or stack adjustments
+    while (avail >= offset + 4) {
+        uint32_t insn = read_insn(code + offset);
+        if (is_stp_callee_saved(insn) || is_stp_callee_saved_signed(insn) || is_sub_sp(insn)) {
+            offset += 4;
+        }
+        else {
+            break;
+        }
+    }
+
+    out->matched         = true;
+    out->pattern_name    = "arm64_no_frame_pointer";
+    out->prologue_size   = offset;
+    out->min_patch_size  = 4;
+    out->has_pc_relative = false;
+
+    return true;
+}
+
 // Pattern: Null/condition check followed by standard prologue
 // Source: Observed in glibc free(), realloc() - check for null before frame setup
 // Pattern: cbz/cbnz xN, label; <standard_prologue>
@@ -896,6 +956,20 @@ static pattern_handler_t handler_null_check = {
     .match       = match_null_check_prologue,
 };
 
+static pattern_handler_t handler_preindex_callee = {
+    .name        = "arm64_frame_setup_preindex_callee",
+    .description = "Callee-saved pre-indexed: stp xA,xB,[sp,#-N]!; ... stp x29,x30; add x29",
+    .priority    = 93,
+    .match       = match_frame_setup_preindex_callee,
+};
+
+static pattern_handler_t handler_no_frame_pointer = {
+    .name        = "arm64_no_frame_pointer",
+    .description = "No frame pointer: stp x30,xN,[sp,#-M]! (-fomit-frame-pointer)",
+    .priority    = 85,
+    .match       = match_no_frame_pointer,
+};
+
 void
 pattern_init_arm64(void)
 {
@@ -910,7 +984,9 @@ pattern_init_arm64(void)
     pattern_register(&handler_pac);
     pattern_register(&handler_frame_setup);
     pattern_register(&handler_frame_setup_alt);
+    pattern_register(&handler_preindex_callee);
     pattern_register(&handler_null_check);
+    pattern_register(&handler_no_frame_pointer);
     pattern_register(&handler_leaf);
 }
 

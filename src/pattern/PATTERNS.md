@@ -171,6 +171,28 @@ We only match if a valid prologue follows the conditional branch.
 
 ---
 
+### arm64_no_frame_pointer (Priority: 85) [NEW]
+**Source:** GCC/Clang with -fomit-frame-pointer on ARM64
+
+**Pattern:** LR saved with callee-saved, no frame pointer setup
+```
+stp x30, xN, [sp, #-M]!  ; Pre-indexed STP saves LR with callee-saved
+[stp xA, xB, [sp, #off]] ; Optional: more callee-saved saves
+; NOTE: No ADD x29, sp instruction (no frame pointer)
+```
+
+**Why safe:** Functions compiled with `-fomit-frame-pointer` still save the link
+register (x30) for proper return, but don't set up x29 as a frame pointer.
+The pre-indexed STP with x30 and callee-saved to sp is specific to function entry.
+
+**False positive risk:** Low. Requires:
+- Pre-indexed STP to sp
+- x30 (LR) in one position, callee-saved (x19-x28) in the other
+
+**Reference:** Observed in GCC/Clang -O2 -fomit-frame-pointer compiled code on Linux ARM64
+
+---
+
 ### arm64_leaf (Priority: 80)
 **Source:** Leaf functions that don't call other functions
 
