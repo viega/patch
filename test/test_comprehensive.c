@@ -141,7 +141,6 @@ static void* hook_replace_pointer(void *p) {
     return &g_hook_target;
 }
 
-#ifndef PATCH_PLATFORM_DARWIN
 static bool dummy_prologue(patch_context_t *ctx, void *ud) {
     (void)ctx;
     (void)ud;
@@ -196,7 +195,6 @@ static bool stack_arg_prologue(patch_context_t *ctx, void *ud) {
     return false;  // Skip original
 #endif
 }
-#endif
 
 // ============================================================================
 // Section 1: Basic API Validation
@@ -254,7 +252,6 @@ static void test_config_validation(void)
 {
     printf("Test: Config validation (replacement vs callbacks)...\n");
 
-#ifndef PATCH_PLATFORM_DARWIN
     patch_error_t err;
     patch_handle_t *handle = NULL;
 
@@ -273,16 +270,12 @@ static void test_config_validation(void)
     assert(err == PATCH_ERR_INVALID_ARGUMENT);
 
     TEST_PASS();
-#else
-    TEST_SKIP("Low-level API not available on macOS");
-#endif
 }
 
 // ============================================================================
 // Section 2: Simple Replacement Mode (New Feature)
 // ============================================================================
 
-#ifndef PATCH_PLATFORM_DARWIN
 static patch_handle_t *g_simple_handle = NULL;
 
 static int simple_replacement_hook(int a, int b)
@@ -296,7 +289,7 @@ static void test_simple_replacement_mode(void)
 {
     printf("Test: Simple replacement mode...\n");
 
-    patch_error_t err = patch_can_install((void*)func_add);
+    patch_error_t err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_add));
     if (err != PATCH_SUCCESS) {
         TEST_SKIP("Pattern not recognized");
         return;
@@ -308,7 +301,7 @@ static void test_simple_replacement_mode(void)
 
     // Install simple replacement
     patch_config_t config = {
-        .target = (void*)func_add,
+        .target = (void*)PATCH_HOOK_ORIGINAL(func_add),
         .replacement = (void*)simple_replacement_hook,
     };
 
@@ -349,14 +342,14 @@ static void test_simple_replacement_disable_enable(void)
 {
     printf("Test: Simple replacement disable/enable...\n");
 
-    patch_error_t err = patch_can_install((void*)func_sub);
+    patch_error_t err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_sub));
     if (err != PATCH_SUCCESS) {
         TEST_SKIP("Pattern not recognized");
         return;
     }
 
     patch_config_t config = {
-        .target = (void*)func_sub,
+        .target = (void*)PATCH_HOOK_ORIGINAL(func_sub),
         .replacement = (void*)hook_negate_result_via_trampoline,
     };
 
@@ -390,13 +383,11 @@ static void test_simple_replacement_disable_enable(void)
     g_disable_enable_handle = NULL;
     TEST_PASS();
 }
-#endif
 
 // ============================================================================
-// Section 3: PATCH_METHOD_CODE Testing (Linux Only)
+// Section 3: PATCH_METHOD_CODE Testing
 // ============================================================================
 
-#ifndef PATCH_PLATFORM_DARWIN
 static void test_method_code_basic(void)
 {
     printf("Test: PATCH_METHOD_CODE basic functionality...\n");
@@ -438,7 +429,6 @@ static void test_method_code_vs_pointer(void)
 
     TEST_PASS();
 }
-#endif
 
 // ============================================================================
 // Section 4: Edge Cases and Stress Tests
@@ -559,7 +549,6 @@ static void test_hook_is_installed_macro(void)
 }
 
 // Re-entrancy guard test components
-#ifndef PATCH_PLATFORM_DARWIN
 
 // Test function for re-entrancy
 PATCH_DEFINE_HOOKABLE(int, func_reentrant, int depth)
@@ -609,7 +598,7 @@ static void test_reentrancy_guard(void)
     // Install hook that calls the hooked function recursively
     patch_handle_t *handle = NULL;
     patch_config_t config = {
-        .target = (void *)func_reentrant,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_reentrant),
         .prologue = reentrant_prologue,
     };
 
@@ -695,7 +684,7 @@ static void test_hook_chaining(void)
     // Install hook A (first)
     patch_handle_t *handle_a = NULL;
     patch_config_t config_a = {
-        .target = (void *)func_identity,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_identity),
         .prologue = chain_prologue_A,
     };
 
@@ -725,7 +714,7 @@ static void test_hook_chaining(void)
     // Install hook B (second) - should chain with A
     patch_handle_t *handle_b = NULL;
     patch_config_t config_b = {
-        .target = (void *)func_identity,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_identity),
         .prologue = chain_prologue_B,
     };
 
@@ -786,21 +775,19 @@ static void test_hook_chaining(void)
 
     TEST_PASS();
 }
-#endif
 
 static void test_idempotent_operations(void)
 {
     printf("Test: Idempotent disable/enable...\n");
 
-#ifndef PATCH_PLATFORM_DARWIN
-    patch_error_t err = patch_can_install((void*)func_add);
+    patch_error_t err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_add));
     if (err != PATCH_SUCCESS) {
         TEST_SKIP("Pattern not recognized");
         return;
     }
 
     patch_config_t config = {
-        .target = (void*)func_add,
+        .target = (void*)PATCH_HOOK_ORIGINAL(func_add),
         .replacement = (void*)hook_add_1000,
     };
 
@@ -821,9 +808,6 @@ static void test_idempotent_operations(void)
 
     patch_remove(handle);
     TEST_PASS();
-#else
-    TEST_SKIP("Low-level API not available on macOS");
-#endif
 }
 
 // ============================================================================
@@ -847,7 +831,6 @@ static void test_many_arguments(void)
     TEST_PASS();
 }
 
-#ifndef PATCH_PLATFORM_DARWIN
 static void test_stack_arguments(void)
 {
     printf("Test: Stack argument access...\n");
@@ -864,7 +847,7 @@ static void test_stack_arguments(void)
     // Install a hook that captures stack arguments
     patch_handle_t *handle = NULL;
     patch_config_t config = {
-        .target = (void *)func_many_args,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_many_args),
         .prologue = stack_arg_prologue,
     };
 
@@ -931,7 +914,6 @@ static void test_stack_arguments(void)
     patch_remove(handle);
     TEST_PASS();
 }
-#endif
 
 static void test_64bit_return_value(void)
 {
@@ -976,7 +958,7 @@ static void test_pointer_return_value(void)
 // Section 5b: FFI-based Full Argument Forwarding (Optional libffi)
 // ============================================================================
 
-#if defined(PATCH_HAVE_LIBFFI) && !defined(PATCH_PLATFORM_DARWIN)
+#if defined(PATCH_HAVE_LIBFFI)
 
 // Simple passthrough prologue that always calls original
 static bool ffi_passthrough_prologue(patch_context_t *ctx, void *ud)
@@ -1006,7 +988,7 @@ static void test_ffi_stack_arguments(void)
     };
 
     patch_config_t config = {
-        .target = (void *)func_many_args,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_many_args),
         .prologue = ffi_passthrough_prologue,
         .arg_types = arg_types,
         .arg_count = 9,
@@ -1060,7 +1042,7 @@ static void test_ffi_mixed_fp_arguments(void)
     };
 
     patch_config_t config = {
-        .target = (void *)func_mixed_args,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_mixed_args),
         .prologue = ffi_passthrough_prologue,
         .arg_types = arg_types,
         .arg_count = 4,
@@ -1112,7 +1094,7 @@ static void test_ffi_fp_only_arguments(void)
     };
 
     patch_config_t config = {
-        .target = (void *)func_fp_only,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_fp_only),
         .prologue = ffi_passthrough_prologue,
         .arg_types = arg_types,
         .arg_count = 3,
@@ -1141,7 +1123,7 @@ static void test_ffi_fp_only_arguments(void)
     TEST_PASS();
 }
 
-#endif // PATCH_HAVE_LIBFFI && !PATCH_PLATFORM_DARWIN
+#endif // PATCH_HAVE_LIBFFI
 
 // ============================================================================
 // Section 6: Error Message Tests
@@ -1190,36 +1172,33 @@ static void test_platform_detection(void)
     TEST_PASS();
 }
 
-#ifndef PATCH_PLATFORM_DARWIN
 static void test_pattern_recognition(void)
 {
     printf("Test: Pattern recognition for test functions...\n");
 
     // All our test functions use PATCH_DEFINE_HOOKABLE which includes
-    // the patchable_function_entry attribute on Linux
+    // the patchable_function_entry attribute
     patch_error_t err;
 
-    err = patch_can_install((void*)func_add);
+    err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_add));
     printf("  func_add: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
 
-    err = patch_can_install((void*)func_sub);
+    err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_sub));
     printf("  func_sub: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
 
-    err = patch_can_install((void*)func_mul);
+    err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_mul));
     printf("  func_mul: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
 
-    err = patch_can_install((void*)func_chain_a);
+    err = patch_can_install((void*)PATCH_HOOK_ORIGINAL(func_chain_a));
     printf("  func_chain_a: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
 
     TEST_PASS();
 }
-#endif
 
 // ============================================================================
 // Section 8: Symbol-Based Hooking API
 // ============================================================================
 
-#ifndef PATCH_PLATFORM_DARWIN
 static bool g_symbol_hook_called = false;
 
 static bool symbol_hook_prologue(patch_context_t *ctx, void *user_data)
@@ -1275,6 +1254,12 @@ static void test_install_by_symbol(void)
 {
     printf("Test: Install hook by symbol name...\n");
 
+#ifdef PATCH_PLATFORM_DARWIN
+    // On macOS, system library functions are in the dyld shared cache,
+    // which has restrictions on code modification. Skip hooking libc functions.
+    printf("  macOS: Skipping libc function hooking (dyld shared cache)\n");
+    TEST_SKIP("system library hooking not supported on macOS");
+#else
     g_symbol_hook_called = false;
 
     patch_config_t config = {
@@ -1304,6 +1289,7 @@ static void test_install_by_symbol(void)
     assert(g_symbol_hook_called == false);
 
     TEST_PASS();
+#endif
 }
 
 static void test_install_symbol_invalid(void)
@@ -1334,9 +1320,10 @@ static void test_install_symbol_invalid(void)
 }
 
 // ============================================================================
-// Section 9: GOT/PLT Hooking
+// Section 9: GOT/PLT Hooking (ELF-only, Linux)
 // ============================================================================
 
+#ifndef PATCH_PLATFORM_DARWIN
 static int g_got_hook_call_count = 0;
 static int (*g_original_atoi)(const char *) = NULL;
 
@@ -1476,6 +1463,7 @@ static void test_got_method_auto(void)
     patch_remove(handle);
     TEST_PASS();
 }
+#endif // !PATCH_PLATFORM_DARWIN (Section 9: GOT/PLT)
 
 // ============================================================================
 // Section 10: Hot-Swap Hooks
@@ -1527,7 +1515,7 @@ static void test_hot_swap_prologue(void)
 
     // Install hook with prologue v1
     patch_config_t config = {
-        .target = (void *)func_identity,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_identity),
         .prologue = hotswap_prologue_v1,
     };
 
@@ -1584,7 +1572,7 @@ static void test_hot_swap_epilogue(void)
 
     // Install hook with epilogue v1
     patch_config_t config = {
-        .target = (void *)func_identity,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_identity),
         .prologue = hotswap_prologue_v1,  // Need a prologue to have a dispatcher
         .epilogue = hotswap_epilogue_v1,
     };
@@ -1634,7 +1622,7 @@ static void test_hot_swap_callbacks(void)
 
     // Install hook with v1 callbacks
     patch_config_t config = {
-        .target = (void *)func_identity,
+        .target = (void *)PATCH_HOOK_ORIGINAL(func_identity),
         .prologue = hotswap_prologue_v1,
         .epilogue = hotswap_epilogue_v1,
     };
@@ -1691,7 +1679,8 @@ static void test_hot_swap_invalid(void)
     TEST_PASS();
 }
 
-// Test hot-swap replacement for GOT hooks
+// Test hot-swap replacement for GOT hooks (ELF-only)
+#ifndef PATCH_PLATFORM_DARWIN
 static int g_got_hotswap_v1_calls = 0;
 static int g_got_hotswap_v2_calls = 0;
 static int (*g_got_original_atoi_hotswap)(const char *) = NULL;
@@ -1763,7 +1752,7 @@ static void test_hot_swap_got_replacement(void)
     patch_remove(handle);
     TEST_PASS();
 }
-#endif
+#endif // !PATCH_PLATFORM_DARWIN (GOT hot-swap)
 
 // ============================================================================
 // Section 11: Breakpoint-Based Hooking
@@ -2033,7 +2022,7 @@ int main(void)
     printf("=== Comprehensive Patch Library Tests ===\n");
     printf("Platform: ");
 #ifdef PATCH_PLATFORM_DARWIN
-    printf("macOS ARM64 (pointer indirection only)\n");
+    printf("macOS (code patching and breakpoint hooking)\n");
 #elif defined(PATCH_ARCH_ARM64)
     printf("Linux ARM64\n");
 #else
@@ -2048,27 +2037,13 @@ int main(void)
 
     // Section 2: Simple Replacement Mode
     printf("\n--- Section 2: Simple Replacement Mode ---\n\n");
-#ifndef PATCH_PLATFORM_DARWIN
     test_simple_replacement_mode();
     test_simple_replacement_disable_enable();
-#else
-    printf("Test: Simple replacement mode...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Simple replacement disable/enable...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-#endif
 
     // Section 3: PATCH_METHOD_CODE
     printf("\n--- Section 3: PATCH_METHOD_CODE ---\n\n");
-#ifndef PATCH_PLATFORM_DARWIN
     test_method_code_basic();
     test_method_code_vs_pointer();
-#else
-    printf("Test: PATCH_METHOD_CODE basic functionality...\n");
-    TEST_SKIP("Code patching not available on macOS");
-    printf("Test: PATCH_METHOD_CODE vs PATCH_METHOD_POINTER...\n");
-    TEST_SKIP("Code patching not available on macOS");
-#endif
 
     // Section 4: Edge Cases
     printf("\n--- Section 4: Edge Cases ---\n\n");
@@ -2078,27 +2053,18 @@ int main(void)
     test_identity_function_hook();
     test_hook_is_installed_macro();
     test_idempotent_operations();
-#ifndef PATCH_PLATFORM_DARWIN
     test_reentrancy_guard();
     test_hook_chaining();
-#else
-    printf("Test: Re-entrancy guard prevents infinite recursion...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Hook chaining (multiple hooks on same target)...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-#endif
 
     // Section 5: Data Types
     printf("\n--- Section 5: Data Types ---\n\n");
     test_many_arguments();
-#ifndef PATCH_PLATFORM_DARWIN
     test_stack_arguments();
-#endif
     test_64bit_return_value();
     test_pointer_return_value();
 
     // Section 5b: FFI argument forwarding
-#if defined(PATCH_HAVE_LIBFFI) && !defined(PATCH_PLATFORM_DARWIN)
+#if defined(PATCH_HAVE_LIBFFI)
     printf("\n--- Section 5b: FFI Argument Forwarding ---\n\n");
     test_ffi_stack_arguments();
     test_ffi_mixed_fp_arguments();
@@ -2112,29 +2078,16 @@ int main(void)
     // Section 7: Platform
     printf("\n--- Section 7: Platform ---\n\n");
     test_platform_detection();
-#ifndef PATCH_PLATFORM_DARWIN
     test_pattern_recognition();
-#endif
 
     // Section 8: Symbol-Based Hooking
     printf("\n--- Section 8: Symbol-Based Hooking ---\n\n");
-#ifndef PATCH_PLATFORM_DARWIN
     test_resolve_symbol();
     test_resolve_symbol_invalid();
     test_install_by_symbol();
     test_install_symbol_invalid();
-#else
-    printf("Test: Symbol resolution API...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Symbol resolution with invalid inputs...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Install hook by symbol name...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Install by symbol with invalid inputs...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-#endif
 
-    // Section 9: GOT/PLT Hooking
+    // Section 9: GOT/PLT Hooking (ELF-only, Linux)
     printf("\n--- Section 9: GOT/PLT Hooking ---\n\n");
 #ifndef PATCH_PLATFORM_DARWIN
     test_got_hooking_basic();
@@ -2142,32 +2095,24 @@ int main(void)
     test_got_method_auto();
 #else
     printf("Test: GOT hooking basic...\n");
-    TEST_SKIP("GOT hooking not available on macOS");
+    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
     printf("Test: GOT hooking disable/enable...\n");
-    TEST_SKIP("GOT hooking not available on macOS");
+    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
     printf("Test: GOT hooking with AUTO method...\n");
-    TEST_SKIP("GOT hooking not available on macOS");
+    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
 #endif
 
     // Section 10: Hot-Swap Hooks
     printf("\n--- Section 10: Hot-Swap Hooks ---\n\n");
-#ifndef PATCH_PLATFORM_DARWIN
     test_hot_swap_prologue();
     test_hot_swap_epilogue();
     test_hot_swap_callbacks();
     test_hot_swap_invalid();
-    test_hot_swap_got_replacement();
+#ifndef PATCH_PLATFORM_DARWIN
+    test_hot_swap_got_replacement();  // GOT hooking is ELF-only
 #else
-    printf("Test: Hot-swap prologue callback...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Hot-swap epilogue callback...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Hot-swap both callbacks atomically...\n");
-    TEST_SKIP("Low-level API not available on macOS");
-    printf("Test: Hot-swap with invalid arguments...\n");
-    TEST_SKIP("Low-level API not available on macOS");
     printf("Test: Hot-swap GOT replacement function...\n");
-    TEST_SKIP("GOT hooking not available on macOS");
+    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
 #endif
 
     // Section 11: Breakpoint-Based Hooking

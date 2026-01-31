@@ -13,6 +13,8 @@ Key features:
 - **Hook chaining**: Multiple hooks on the same target, executed in reverse installation order
 - **Re-entrancy guard**: Prevents infinite recursion when hook code calls the hooked function
 - **FFI support**: Optional libffi integration for full argument forwarding (including stack and FP args)
+- **Breakpoint hooking**: Fallback mechanism using INT3 (x86-64) or BRK (ARM64) + SIGTRAP for functions without NOP sleds
+- **Cross-platform code patching**: Works on both Linux and macOS (using VM_PROT_COPY for W→X protection sequencing)
 
 ## Architecture Overview
 
@@ -72,6 +74,8 @@ patch/
 │   ├── patch_internal.h  # Internal declarations
 │   ├── trampoline.c      # Trampoline creation/destruction
 │   ├── dispatcher.c      # Generated dispatcher stubs
+│   ├── breakpoint.c      # Breakpoint-based hooking (SIGTRAP handler)
+│   ├── breakpoint.h      # Internal breakpoint API
 │   ├── arch/
 │   │   ├── arch.h        # Architecture interface
 │   │   ├── x86_64.c      # x86-64 instruction handling
@@ -394,9 +398,18 @@ Strategy:
 4. `__builtin___clear_cache()` on ARM64
 
 **macOS**:
-- Hardware W^X on Apple Silicon prevents runtime code modification
-- Unified macro layer uses pointer indirection instead
-- `patchable_function_entry` attribute is the only option for code patching
+macOS enforces W^X (pages cannot be W+X simultaneously), but code patching works via sequential protection changes:
+1. `vm_protect(page, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)` — Make writable with CoW
+2. `memcpy(target, data, size)` — Write the code
+3. `vm_protect(page, VM_PROT_READ | VM_PROT_EXECUTE)` — Make executable
+4. `sys_icache_invalidate()` on ARM64
+
+**Note:** `VM_PROT_COPY` is critical - it requests a copy-on-write copy of the page, which allows
+modifying code even in hardened binaries. Without it, vm_protect fails on signed code.
+
+**Limitations on macOS:**
+- System libraries (libc, etc.) are in the dyld shared cache and may resist modification
+- For system library hooking, use GOT hooking (Linux only) or the unified macro interface
 
 ## Unified Macro Interface
 
@@ -570,9 +583,10 @@ patch_config_t config = {
 ```
 
 **Method selection:**
-- `PATCH_METHOD_AUTO` — Try GOT first, fall back to code patching (default)
-- `PATCH_METHOD_GOT` — Force GOT hooking, fail if no GOT entry
-- `PATCH_METHOD_CODE` — Force code patching
+- `PATCH_METHOD_AUTO` — Try code patching first, fall back to breakpoint if pattern unrecognized (default)
+- `PATCH_METHOD_GOT` — Force GOT hooking, fail if no GOT entry (Linux only, ELF format)
+- `PATCH_METHOD_CODE` — Force code patching, fail if pattern unrecognized
+- `PATCH_METHOD_BREAKPOINT` — Force breakpoint-based hooking (INT3/BRK + SIGTRAP handler)
 
 **GOT hooking advantages:**
 - No instruction decoding or relocation needed
@@ -583,6 +597,45 @@ patch_config_t config = {
 - Only works for imported functions (calls through PLT)
 - Does not support prologue/epilogue callbacks (replacement only)
 - Per-module (each shared object has its own GOT)
+- **Linux only** — macOS uses different dynamic linking (dyld, not GOT/PLT)
+
+## Breakpoint-Based Hooking
+
+When code patching fails due to unrecognized prologue patterns, breakpoint-based hooking provides a fallback:
+
+```c
+// AUTO method will automatically try breakpoint if code patching fails
+patch_config_t config = {
+    .target = some_function_without_nop_sled,
+    .prologue = my_prologue,
+    .method = PATCH_METHOD_AUTO,  // Falls back to breakpoint
+};
+
+// Or explicitly request breakpoint hooking
+patch_config_t config = {
+    .target = any_function,
+    .prologue = my_prologue,
+    .method = PATCH_METHOD_BREAKPOINT,
+};
+```
+
+**How it works:**
+1. Install a breakpoint instruction at the function entry (INT3 on x86-64, BRK #0 on ARM64)
+2. Register a SIGTRAP signal handler that:
+   - Looks up the breakpoint by faulting PC
+   - Extracts registers from the signal context (ucontext_t)
+   - Calls prologue/epilogue callbacks
+   - Resumes execution via a mini-trampoline (original instruction + jump back)
+
+**Breakpoint hooking advantages:**
+- Works on any function, regardless of prologue pattern
+- No NOP sled required
+- Supports all callback features (prologue, epilogue, argument inspection)
+
+**Breakpoint hooking limitations:**
+- Higher overhead than code patching (signal handling per call)
+- May conflict with debuggers (gdb, lldb) since both use SIGTRAP
+- The previous signal handler is chained, but interactions can be complex
 
 ## Hot-Swap Hooks
 
