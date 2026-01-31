@@ -13,6 +13,19 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
+# Detect host OS for capability support
+# Hardware watchpoints (perf_event_open) only work on native Linux hosts
+HOST_OS="$(uname -s)"
+EXTRA_RUN_ARGS=""
+
+if [[ "$HOST_OS" == "Linux" ]]; then
+    # Add capabilities for hardware watchpoints via perf_event_open
+    # CAP_PERFMON: allows perf_event_open (Linux 5.8+)
+    # seccomp=unconfined: allows perf syscalls that may be blocked by default
+    EXTRA_RUN_ARGS="--cap-add=CAP_PERFMON --cap-add=CAP_SYS_PTRACE --security-opt seccomp=unconfined"
+    echo "Linux host detected: enabling watchpoint capabilities"
+fi
+
 # Check if docker/podman is available
 if command -v docker &> /dev/null; then
     CONTAINER_CMD="docker"
@@ -39,7 +52,8 @@ run_test() {
 
     if [[ -n "$NATIVE_ONLY" ]]; then
         $CONTAINER_CMD build -t "patch-test-$arch" --target test .
-        $CONTAINER_CMD run --rm "patch-test-$arch"
+        # shellcheck disable=SC2086
+        $CONTAINER_CMD run --rm $EXTRA_RUN_ARGS "patch-test-$arch"
     else
         $CONTAINER_CMD buildx build \
             --platform "$platform" \
@@ -47,7 +61,8 @@ run_test() {
             -t "patch-test-$arch" \
             --load \
             .
-        $CONTAINER_CMD run --rm --platform "$platform" "patch-test-$arch"
+        # shellcheck disable=SC2086
+        $CONTAINER_CMD run --rm --platform "$platform" $EXTRA_RUN_ARGS "patch-test-$arch"
     fi
 
     echo ""
