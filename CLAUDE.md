@@ -9,6 +9,11 @@ See parent `../CLAUDE.md` for version control rules (jj workflow) and general C2
 Runtime function hooking library for x86-64 and ARM64 on Linux (ELF) and macOS (Mach-O).
 Enables inserting detours at function prologues and epilogues with argument/return inspection.
 
+Key features:
+- **Hook chaining**: Multiple hooks on the same target, executed in reverse installation order
+- **Re-entrancy guard**: Prevents infinite recursion when hook code calls the hooked function
+- **FFI support**: Optional libffi integration for full argument forwarding (including stack and FP args)
+
 ## Architecture Overview
 
 ```
@@ -130,31 +135,40 @@ The dispatcher is dynamically generated machine code that bridges between the ho
 ### ARM64 Dispatcher (src/dispatcher.c)
 
 ```asm
-; Stack layout: 128 bytes
-;   [sp, #0-15]:  x29, x30 (frame/link)
-;   [sp, #16-79]: x0-x7 (saved arguments)
-;   [sp, #80-127]: padding
+; Stack layout: 288 bytes
+;   [sp, #0-15]:   x29, x30 (frame/link)
+;   [sp, #16-79]:  x0-x7 (integer arguments)
+;   [sp, #80-207]: v0-v7 (FP arguments, 128-bit each)
+;   [sp, #208-223]: fp_return storage
 
-stp x29, x30, [sp, #-128]!    ; Save frame/link, allocate stack
-stp x0, x1, [sp, #16]         ; Save arguments
+stp x29, x30, [sp, #-288]!    ; Save frame/link, allocate stack
+stp x0, x1, [sp, #16]         ; Save integer arguments
 stp x2, x3, [sp, #32]
 stp x4, x5, [sp, #48]
 stp x6, x7, [sp, #64]
+stp q0, q1, [sp, #80]         ; Save FP arguments
+stp q2, q3, [sp, #112]
+stp q4, q5, [sp, #144]
+stp q6, q7, [sp, #176]
 mov x29, sp                    ; Set up frame
 
 ldr x0, [pc, #offset_handle]   ; x0 = handle
-add x1, sp, #16                ; x1 = pointer to saved args
-ldr x2, [pc, #offset_tramp]    ; x2 = trampoline
+add x1, sp, #16                ; x1 = pointer to saved int args
+add x2, sp, #80                ; x2 = pointer to saved FP args
+add x3, sp, #288               ; x3 = caller's stack (for stack args)
+ldr x4, [pc, #offset_tramp]    ; x4 = trampoline
+add x5, sp, #208               ; x5 = pointer to fp_return
 ldr x16, [pc, #offset_func]    ; x16 = patch__dispatch_full
 blr x16                        ; Call dispatch helper
 
-ldp x29, x30, [sp], #128       ; Restore and deallocate
-ret                            ; Return (result in x0)
+ldr q0, [sp, #208]             ; Load FP return value into v0
+ldp x29, x30, [sp], #288       ; Restore and deallocate
+ret                            ; Return (int in x0, FP in v0)
 
 ; Embedded data (8-byte aligned at end):
-.quad patch__dispatch_full     ; @offset 232
-.quad handle                   ; @offset 240
-.quad trampoline               ; @offset 248
+.quad patch__dispatch_full
+.quad handle
+.quad trampoline
 ```
 
 ### x86-64 Dispatcher
@@ -162,9 +176,9 @@ ret                            ; Return (result in x0)
 ```asm
 push rbp
 mov rbp, rsp
-sub rsp, 128                   ; Allocate stack
+sub rsp, 256                   ; Allocate stack
 
-; Save arguments at [rbp-48] through [rbp-8]
+; Save integer arguments at [rbp-48] through [rbp-8]
 mov [rbp-48], rdi              ; arg0
 mov [rbp-40], rsi              ; arg1
 mov [rbp-32], rdx              ; arg2
@@ -172,51 +186,85 @@ mov [rbp-24], rcx              ; arg3
 mov [rbp-16], r8               ; arg4
 mov [rbp-8], r9                ; arg5
 
-movabs rdi, handle             ; First arg: handle
-lea rsi, [rbp-48]              ; Second arg: pointer to saved args
-movabs rdx, trampoline         ; Third arg: trampoline
+; Save FP arguments at [rbp-176] through [rbp-64]
+movups [rbp-176], xmm0
+movups [rbp-160], xmm1
+movups [rbp-144], xmm2
+movups [rbp-128], xmm3
+movups [rbp-112], xmm4
+movups [rbp-96], xmm5
+movups [rbp-80], xmm6
+movups [rbp-64], xmm7
+
+movabs rdi, handle             ; arg0: handle
+lea rsi, [rbp-48]              ; arg1: pointer to saved int args
+lea rdx, [rbp-176]             ; arg2: pointer to saved FP args
+lea rcx, [rbp+16]              ; arg3: caller's stack
+movabs r8, trampoline          ; arg4: trampoline
+lea r9, [rbp-192]              ; arg5: pointer to fp_return
 movabs rax, patch__dispatch_full
 call rax
 
+movups xmm0, [rbp-192]         ; Load FP return value into xmm0
 mov rsp, rbp
 pop rbp
-ret                            ; Result in rax
+ret                            ; int result in rax, FP in xmm0
 ```
 
 ### C Dispatch Helper (patch__dispatch_full)
 
 ```c
-uint64_t patch__dispatch_full(patch_handle_t *handle, uint64_t *args, void *trampoline)
+uint64_t patch__dispatch_full(patch_handle_t  *handle,
+                              uint64_t        *args,
+                              patch__fp_reg_t *fp_args,
+                              void            *caller_stack,
+                              void            *trampoline,
+                              patch__fp_reg_t *fp_return)
 {
+    // Re-entrancy check: if this hook is already active on this thread,
+    // bypass callbacks and call the next in chain directly
+    if (is_hook_active(handle)) {
+        return call_next_directly(handle, args);
+    }
+
+    push_active_hook(handle);
+
     patch_context_t ctx = {0};
     ctx.handle = handle;
+    ctx.caller_stack = caller_stack;
     memcpy(ctx.args, args, sizeof(ctx.args));
+    memcpy(ctx.fp_args, fp_args, sizeof(ctx.fp_args));
+
+    // Get next callable in chain (next hook's dispatcher or trampoline)
+    void *next_callable = patch__get_chain_next(handle);
 
     // Prologue callback
     bool call_original = true;
     if (handle->prologue) {
         call_original = handle->prologue(&ctx, handle->prologue_user_data);
-        if (call_original) {
-            // Copy modified args back
-            memcpy(args, ctx.args, sizeof(ctx.args));
-        }
+        // Copy potentially modified args back
     }
 
-    // Call original via trampoline (or use fake return)
     uint64_t result;
     if (call_original) {
-        result = ((fn_t)trampoline)(args[0], args[1], args[2], args[3], args[4], args[5]);
-        ctx.return_value = result;
-    } else {
-        result = ctx.return_value;
+#ifdef PATCH_HAVE_LIBFFI
+        if (handle->ffi_cif) {
+            // Use FFI for full argument forwarding (int, FP, and stack args)
+            ffi_call(handle->ffi_cif, next_callable, &result_or_fp_return, arg_values);
+        } else
+#endif
+        {
+            // Direct call with register args only
+            result = ((fn_t)next_callable)(args[0], args[1], ...);
+        }
     }
 
     // Epilogue callback
     if (handle->epilogue) {
         handle->epilogue(&ctx, handle->epilogue_user_data);
-        result = ctx.return_value;
     }
 
+    pop_active_hook();
     return result;
 }
 ```
@@ -423,6 +471,84 @@ Error codes (`patch_error_t`):
 - `PATCH_ERR_INTERNAL` — Unexpected internal error
 
 Thread-local error details: `patch_get_error_details()` returns detailed message.
+
+## Hook Chaining
+
+Multiple hooks can be installed on the same target function. Hooks are executed in reverse installation order (most recent first).
+
+```c
+// Install first hook
+patch_install(&config_A, &handle_A);  // Will be called second
+
+// Install second hook on same target
+patch_install(&config_B, &handle_B);  // Will be called first
+
+// Call flow: target → B's dispatcher → A's dispatcher → trampoline → original
+```
+
+The chain is maintained via `chain_next` and `chain_prev` pointers in each handle. When a hook is removed from the middle of a chain, the detour is updated to point to the next hook.
+
+## Re-entrancy Guard
+
+A thread-local linked list tracks active hooks to prevent infinite recursion:
+
+```c
+bool my_prologue(patch_context_t *ctx, void *user_data) {
+    // If this hook calls the hooked function, the dispatcher detects
+    // re-entrancy and bypasses callbacks, calling the next in chain directly
+    some_function_that_might_call_target();
+    return true;
+}
+```
+
+## FFI Support (Optional)
+
+When built with libffi (`-Duse_libffi=true`), full argument forwarding is available:
+
+```c
+// Function with 9 arguments (some on stack)
+int func(int a, int b, int c, int d, int e, int f, int g, int h, int i);
+
+ffi_type *arg_types[] = {
+    &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+    &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+    &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+};
+
+patch_config_t config = {
+    .target = (void *)func,
+    .prologue = my_prologue,
+    .arg_types = arg_types,
+    .arg_count = 9,
+    .return_type = &ffi_type_sint,
+};
+```
+
+Without FFI, only register arguments are forwarded:
+- **x86-64**: 6 integer (rdi, rsi, rdx, rcx, r8, r9) + 8 FP (xmm0-7)
+- **ARM64**: 8 integer (x0-x7) + 8 FP (v0-v7)
+
+With FFI, all arguments including stack-passed and floating-point are correctly forwarded.
+
+## Symbol-Based Hooking
+
+Functions can be hooked by symbol name without needing to know their address:
+
+```c
+// Resolve a symbol to an address
+void *addr;
+patch_resolve_symbol("malloc", NULL, &addr);  // From current process
+patch_resolve_symbol("SSL_read", "libssl.so", &addr);  // From specific library
+
+// Install hook by symbol name (combines resolve + install)
+patch_config_t config = { .prologue = my_prologue };
+patch_handle_t *handle;
+patch_install_symbol("atoi", NULL, &config, &handle);
+```
+
+The library parameter can be:
+- `NULL` — Search all loaded libraries (uses RTLD_DEFAULT)
+- Library path — Load and search that specific library
 
 ## Code Style
 

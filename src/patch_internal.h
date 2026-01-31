@@ -83,11 +83,13 @@ void          patch__dispatcher_destroy(void *dispatcher);
 // Dispatch function called by generated dispatcher stub
 // fp_args points to saved FP registers (8 x 128-bit)
 // caller_stack points to the caller's stack frame (for accessing stack arguments)
+// fp_return is where to store FP return value (for functions returning float/double)
 uint64_t patch__dispatch_full(patch_handle_t  *handle,
                               uint64_t        *args,
                               patch__fp_reg_t *fp_args,
                               void            *caller_stack,
-                              void            *trampoline);
+                              void            *trampoline,
+                              patch__fp_reg_t *fp_return);
 
 // Write the detour jump at target
 patch_error_t patch__write_detour(void *target, void *destination, size_t available_size);

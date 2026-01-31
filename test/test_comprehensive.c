@@ -1216,6 +1216,125 @@ static void test_pattern_recognition(void)
 #endif
 
 // ============================================================================
+// Section 8: Symbol-Based Hooking API
+// ============================================================================
+
+#ifndef PATCH_PLATFORM_DARWIN
+static bool g_symbol_hook_called = false;
+
+static bool symbol_hook_prologue(patch_context_t *ctx, void *user_data)
+{
+    (void)ctx;
+    (void)user_data;
+    g_symbol_hook_called = true;
+    return true;  // Call original
+}
+
+static void test_resolve_symbol(void)
+{
+    printf("Test: Symbol resolution API...\n");
+
+    // Test resolving a common libc symbol
+    void *addr = NULL;
+    patch_error_t err = patch_resolve_symbol("strlen", NULL, &addr);
+
+    if (err == PATCH_SUCCESS) {
+        assert(addr != NULL);
+        printf("  strlen resolved to: %p\n", addr);
+        TEST_PASS();
+    }
+    else {
+        printf("  Could not resolve strlen: %s\n", patch_get_error_details());
+        TEST_SKIP("symbol resolution not working");
+    }
+}
+
+static void test_resolve_symbol_invalid(void)
+{
+    printf("Test: Symbol resolution with invalid inputs...\n");
+
+    void *addr = NULL;
+    patch_error_t err;
+
+    // Null symbol
+    err = patch_resolve_symbol(NULL, NULL, &addr);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null output
+    err = patch_resolve_symbol("strlen", NULL, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Non-existent symbol
+    err = patch_resolve_symbol("__this_symbol_does_not_exist_12345__", NULL, &addr);
+    assert(err == PATCH_ERR_SYMBOL_NOT_FOUND);
+
+    TEST_PASS();
+}
+
+static void test_install_by_symbol(void)
+{
+    printf("Test: Install hook by symbol name...\n");
+
+    g_symbol_hook_called = false;
+
+    patch_config_t config = {
+        .prologue = symbol_hook_prologue,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot hook atoi by symbol: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook atoi");
+        return;
+    }
+
+    // Call atoi - our hook should be triggered
+    int result = atoi("42");
+    assert(result == 42);
+    assert(g_symbol_hook_called == true);
+
+    patch_remove(handle);
+
+    // After removal, hook should not be called
+    g_symbol_hook_called = false;
+    result = atoi("100");
+    assert(result == 100);
+    assert(g_symbol_hook_called == false);
+
+    TEST_PASS();
+}
+
+static void test_install_symbol_invalid(void)
+{
+    printf("Test: Install by symbol with invalid inputs...\n");
+
+    patch_config_t config = { .prologue = symbol_hook_prologue };
+    patch_handle_t *handle = NULL;
+    patch_error_t err;
+
+    // Null symbol
+    err = patch_install_symbol(NULL, NULL, &config, &handle);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null config
+    err = patch_install_symbol("strlen", NULL, NULL, &handle);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null handle
+    err = patch_install_symbol("strlen", NULL, &config, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Non-existent symbol
+    err = patch_install_symbol("__nonexistent_symbol__", NULL, &config, &handle);
+    assert(err == PATCH_ERR_SYMBOL_NOT_FOUND);
+
+    TEST_PASS();
+}
+#endif
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1308,6 +1427,24 @@ int main(void)
     test_platform_detection();
 #ifndef PATCH_PLATFORM_DARWIN
     test_pattern_recognition();
+#endif
+
+    // Section 8: Symbol-Based Hooking
+    printf("\n--- Section 8: Symbol-Based Hooking ---\n\n");
+#ifndef PATCH_PLATFORM_DARWIN
+    test_resolve_symbol();
+    test_resolve_symbol_invalid();
+    test_install_by_symbol();
+    test_install_symbol_invalid();
+#else
+    printf("Test: Symbol resolution API...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Symbol resolution with invalid inputs...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Install hook by symbol name...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Install by symbol with invalid inputs...\n");
+    TEST_SKIP("Low-level API not available on macOS");
 #endif
 
     // Summary

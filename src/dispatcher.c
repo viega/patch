@@ -67,14 +67,20 @@ pop_active_hook(void)
 // fp_args points to saved FP registers (8 x 128-bit = 128 bytes)
 // caller_stack points to the caller's stack frame (for accessing stack arguments)
 // trampoline is passed from stub but we use patch__get_chain_next() for chaining support
+// fp_return is where to store FP return value (loaded into xmm0/v0 by dispatcher)
 uint64_t
 patch__dispatch_full(patch_handle_t  *handle,
                      uint64_t        *args,
                      patch__fp_reg_t *fp_args,
                      void            *caller_stack,
-                     void            *trampoline)
+                     void            *trampoline,
+                     patch__fp_reg_t *fp_return)
 {
     (void)trampoline;  // We use patch__get_chain_next() instead for chaining support
+
+    // Initialize FP return to 0
+    fp_return->lo = 0;
+    fp_return->hi = 0;
 
     // Get the next callable in the chain (next hook's dispatcher or actual trampoline)
     void *next_callable = patch__get_chain_next(handle);
@@ -184,10 +190,10 @@ patch__dispatch_full(patch_handle_t  *handle,
                               ret_type->type == FFI_TYPE_LONGDOUBLE);
 
             if (ret_is_fp) {
-                // FP return value goes into FP return register
-                ffi_call(handle->ffi_cif, FFI_FN(next_callable), &ctx.fp_return_value, ffi_arg_values);
-                // Also copy to integer return for compatibility
-                result = ctx.fp_return_value.lo;
+                // FP return value - store in fp_return for dispatcher to load into xmm0/v0
+                ffi_call(handle->ffi_cif, FFI_FN(next_callable), fp_return, ffi_arg_values);
+                ctx.fp_return_value = *fp_return;
+                result = fp_return->lo;
             }
             else {
                 ffi_call(handle->ffi_cif, FFI_FN(next_callable), &result, ffi_arg_values);
@@ -236,12 +242,9 @@ patch__dispatch_full(patch_handle_t  *handle,
 #ifdef PATCH_ARCH_ARM64
 
 // ARM64 dispatcher stub:
-// - Saves x0-x7 (integer args), x29, x30 (frame, link)
-// - Calls patch__dispatch_full(handle, args_ptr, fp_args_ptr, trampoline)
-// - Returns result to caller
-//
-// Note: FP registers are saved to stack for fp_args pointer but not explicitly
-// restored since the C calling convention preserves them across calls.
+// - Saves x0-x7 (integer args), v0-v7 (FP args), x29, x30 (frame, link)
+// - Calls patch__dispatch_full(handle, args_ptr, fp_args_ptr, caller_stack, trampoline, fp_return)
+// - Returns result to caller (integer in x0, FP in v0)
 
 static void
 write_arm64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
@@ -249,32 +252,37 @@ write_arm64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     uint32_t *p   = (uint32_t *)code;
     size_t    idx = 0;
 
-    // Stack layout (256 bytes total):
+    // Stack layout (272 bytes total, rounded up to 288 for 16-byte alignment):
     // [sp+0]:    x29, x30 (frame, link) - 16 bytes
     // [sp+16]:   x0-x7 (integer args) - 64 bytes
-    // [sp+80]:   space for FP args (passed as pointer) - 128 bytes
-    // [sp+208]:  padding - 48 bytes
+    // [sp+80]:   v0-v7 (FP args, 128-bit each) - 128 bytes
+    // [sp+208]:  fp_return storage - 16 bytes
+    // [sp+224]:  padding - 64 bytes
 
-    // stp x29, x30, [sp, #-256]!  ; save frame/link, allocate stack
-    // Encoding: 10 1 01 100 1 imm7 Rt2 Rn Rt
-    // imm7 = -256/8 = -32 = 0b1100000
-    p[idx++] = 0xA9B07BFD;
+    // stp x29, x30, [sp, #-288]!  ; save frame/link, allocate stack
+    // imm7 = -288/8 = -36 = 0xDC in 7-bit signed
+    // Encoding: 10 101 0 011 0 imm7 Rt2 Rn Rt
+    // = 0xA9AE7BFD
+    p[idx++] = 0xA9AE7BFD;
 
     // Save integer registers x0-x7 at [sp+16]
-    // stp x0, x1, [sp, #16]
-    p[idx++] = 0xA90107E0;
-    // stp x2, x3, [sp, #32]
-    p[idx++] = 0xA9020FE2;
-    // stp x4, x5, [sp, #48]
-    p[idx++] = 0xA90317E4;
-    // stp x6, x7, [sp, #64]
-    p[idx++] = 0xA9041FE6;
+    p[idx++] = 0xA90107E0;  // stp x0, x1, [sp, #16]
+    p[idx++] = 0xA9020FE2;  // stp x2, x3, [sp, #32]
+    p[idx++] = 0xA90317E4;  // stp x4, x5, [sp, #48]
+    p[idx++] = 0xA9041FE6;  // stp x6, x7, [sp, #64]
+
+    // Save FP registers v0-v7 at [sp+80]
+    // STP Q-form encoding: 10 1011 010 imm7 Rt2 Rn Rt (imm7 scaled by 16)
+    p[idx++] = 0xAD0287E0;  // stp q0, q1, [sp, #80]   (imm7=5)
+    p[idx++] = 0xAD038FE2;  // stp q2, q3, [sp, #112]  (imm7=7)
+    p[idx++] = 0xAD0497E4;  // stp q4, q5, [sp, #144]  (imm7=9)
+    p[idx++] = 0xAD059FE6;  // stp q6, q7, [sp, #176]  (imm7=11)
 
     // mov x29, sp  ; set up frame pointer
     p[idx++] = 0x910003FD;
 
     // Embedded data offsets (at end of stub, 8-byte aligned)
-    size_t data_base  = 232;
+    size_t data_base  = 280;
     size_t func_off   = data_base;
     size_t handle_off = data_base + 8;
     size_t tramp_off  = data_base + 16;
@@ -286,19 +294,26 @@ write_arm64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     // x1 = pointer to saved integer args (sp + 16): add x1, sp, #16
     p[idx++] = 0x910043E1;
 
-    // x2 = pointer for FP args (sp + 80): add x2, sp, #80
-    // Note: FP args not actually saved, but we need to pass a valid pointer
-    p[idx++] = 0x91014002;
+    // x2 = pointer to saved FP args (sp + 80): add x2, sp, #80
+    // Encoding: 1 0 0 100010 00 imm12 Rn Rd
+    // imm12 = 80 = 0x50, Rn = sp = 31, Rd = x2 = 2
+    // = 0x910143E2
+    p[idx++] = 0x910143E2;
 
-    // x3 = caller's stack pointer (sp + 256): add x3, sp, #256
-    // After stp [sp, #-256]!, original sp is at sp+256, which is where
-    // the caller's stack arguments begin
-    // Encoding: sf=1 opc=00 10001 shift=00 imm12=0x100 Rn=11111(sp) Rd=00011(x3)
-    p[idx++] = 0x910403E3;
+    // x3 = caller's stack pointer (sp + 288): add x3, sp, #288
+    // Encoding: imm12 = 288 = 0x120
+    p[idx++] = 0x910483E3;
 
     // Load trampoline into x4: ldr x4, [pc, #offset]
     int64_t rel_tramp = (int64_t)tramp_off - (int64_t)(idx * 4);
     p[idx++]          = 0x58000004 | (((rel_tramp / 4) & 0x7FFFF) << 5);
+
+    // x5 = pointer to fp_return storage (sp + 208): add x5, sp, #208
+    // Encoding: 1 0 0 100010 00 imm12 Rn Rd
+    // imm12 = 208 = 0xD0 = 0b000011010000
+    // Rn = sp = 31, Rd = x5 = 5
+    // = 0x910343E5
+    p[idx++] = 0x910343E5;
 
     // Load dispatch function into x16: ldr x16, [pc, #offset]
     int64_t rel_func = (int64_t)func_off - (int64_t)(idx * 4);
@@ -307,10 +322,18 @@ write_arm64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     // blr x16  ; call dispatch function
     p[idx++] = 0xD63F0200;
 
-    // Return value is in x0
+    // Integer return value is in x0
+    // Load FP return value from [sp+208] into v0
+    // ldr q0, [sp, #208]
+    // Encoding for LDR (immediate, SIMD&FP): size opc 111101 imm12 Rn Rt
+    // For Q register (128-bit): size=00, opc=11, scale by 16
+    // imm12 = 208/16 = 13 = 0b000000001101
+    // 00 111101 11 000000001101 11111 00000 = 0x3DC037E0
+    p[idx++] = 0x3DC037E0;
 
-    // ldp x29, x30, [sp], #256  ; restore frame/link, deallocate
-    p[idx++] = 0xA8D07BFD;
+    // ldp x29, x30, [sp], #288  ; restore frame/link, deallocate
+    // imm7 = 288/8 = 36
+    p[idx++] = 0xA8D27BFD;
 
     // ret
     p[idx++] = 0xD65F03C0;
@@ -334,6 +357,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     // Stack layout (256 bytes):
     // [rbp-48]:   rdi, rsi, rdx, rcx, r8, r9 (integer args) - 48 bytes
     // [rbp-176]:  xmm0-xmm7 (FP args) - 128 bytes (8 x 16 bytes)
+    // [rbp-192]:  fp_return storage - 16 bytes
     // [rbp-256]:  padding/red zone
 
     // push rbp
@@ -387,10 +411,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0xF8;
 
     // Save XMM registers at [rbp-176] through [rbp-64]
-    // Each movdqu is 16 bytes of data
-
-    // movdqu [rbp-176], xmm0  (0F 11 45 50 in 32-bit offset form won't work, need disp32)
-    // movups [rbp-176], xmm0  ; 0F 11 85 50 FF FF FF
+    // movups [rbp-176], xmm0
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0x85;
@@ -403,7 +424,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0x8D;
-    code[idx++] = 0x60;  // -160 = 0xFFFFFF60
+    code[idx++] = 0x60;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -412,7 +433,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0x95;
-    code[idx++] = 0x70;  // -144 = 0xFFFFFF70
+    code[idx++] = 0x70;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -421,7 +442,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0x9D;
-    code[idx++] = 0x80;  // -128 = 0xFFFFFF80
+    code[idx++] = 0x80;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -430,7 +451,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0xA5;
-    code[idx++] = 0x90;  // -112 = 0xFFFFFF90
+    code[idx++] = 0x90;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -439,7 +460,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0xAD;
-    code[idx++] = 0xA0;  // -96 = 0xFFFFFFA0
+    code[idx++] = 0xA0;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -448,7 +469,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0xB5;
-    code[idx++] = 0xB0;  // -80 = 0xFFFFFFB0
+    code[idx++] = 0xB0;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
@@ -457,12 +478,12 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0x0F;
     code[idx++] = 0x11;
     code[idx++] = 0xBD;
-    code[idx++] = 0xC0;  // -64 = 0xFFFFFFC0
+    code[idx++] = 0xC0;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
 
-    // Call patch__dispatch_full(handle, args, fp_args, caller_stack, trampoline)
+    // Call patch__dispatch_full(handle, args, fp_args, caller_stack, trampoline, fp_return)
 
     // rdi = handle: movabs rdi, imm64
     code[idx++] = 0x48;
@@ -486,20 +507,25 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0xFF;
 
     // rcx = caller_stack: lea rcx, [rbp+16]
-    // After push rbp; mov rbp, rsp:
-    //   [rbp+0] = saved rbp
-    //   [rbp+8] = return address
-    //   [rbp+16] = first stack argument from caller
     code[idx++] = 0x48;
     code[idx++] = 0x8D;
     code[idx++] = 0x4D;
-    code[idx++] = 0x10;  // +16
+    code[idx++] = 0x10;
 
     // r8 = trampoline: movabs r8, imm64
     code[idx++] = 0x49;
     code[idx++] = 0xB8;
     memcpy(code + idx, &trampoline, 8);
     idx += 8;
+
+    // r9 = &fp_return: lea r9, [rbp-192]
+    code[idx++] = 0x4C;
+    code[idx++] = 0x8D;
+    code[idx++] = 0x8D;
+    code[idx++] = 0x40;  // -192 = 0xFFFFFF40
+    code[idx++] = 0xFF;
+    code[idx++] = 0xFF;
+    code[idx++] = 0xFF;
 
     // movabs rax, patch__dispatch_full
     code[idx++]  = 0x48;
@@ -512,18 +538,18 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0xFF;
     code[idx++] = 0xD0;
 
-    // Return value is in rax
-
-    // Restore XMM registers (in case prologue modified them)
-    // movups xmm0, [rbp-176]
+    // Integer return value is in rax
+    // Load FP return value from [rbp-192] into xmm0
+    // movups xmm0, [rbp-192]
     code[idx++] = 0x0F;
     code[idx++] = 0x10;
     code[idx++] = 0x85;
-    code[idx++] = 0x50;
+    code[idx++] = 0x40;  // -192
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
 
+    // Restore XMM1-7 for argument passing (xmm0 is now the return value)
     // movups xmm1, [rbp-160]
     code[idx++] = 0x0F;
     code[idx++] = 0x10;

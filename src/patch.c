@@ -5,6 +5,7 @@
 #include "pattern/pattern.h"
 #include "platform/platform.h"
 
+#include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -645,4 +646,109 @@ patch_get_trampoline(patch_handle_t *handle)
         return nullptr;
     }
     return handle->trampoline->code;
+}
+
+// ============================================================================
+// Symbol Resolution API
+// ============================================================================
+
+patch_error_t
+patch_resolve_symbol(const char *symbol, const char *library, void **address)
+{
+    if (symbol == nullptr || address == nullptr) {
+        patch__set_error("symbol and address must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    *address = nullptr;
+
+    void *lib_handle = nullptr;
+
+    if (library != nullptr) {
+        // Open the specific library
+        lib_handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
+        if (lib_handle == nullptr) {
+            // Library not already loaded, try loading it
+            lib_handle = dlopen(library, RTLD_NOW);
+        }
+        if (lib_handle == nullptr) {
+            patch__set_error("failed to open library '%s': %s", library, dlerror());
+            return PATCH_ERR_SYMBOL_NOT_FOUND;
+        }
+    }
+    else {
+        // Use RTLD_DEFAULT to search all loaded libraries
+        lib_handle = RTLD_DEFAULT;
+    }
+
+    // Clear any previous error
+    dlerror();
+
+    void *sym = dlsym(lib_handle, symbol);
+
+    // Check for error (dlsym can return nullptr for valid symbols)
+    const char *error = dlerror();
+    if (error != nullptr) {
+        patch__set_error("symbol '%s' not found%s%s: %s",
+                         symbol,
+                         library ? " in " : "",
+                         library ? library : "",
+                         error);
+        if (library != nullptr && lib_handle != RTLD_DEFAULT) {
+            dlclose(lib_handle);
+        }
+        return PATCH_ERR_SYMBOL_NOT_FOUND;
+    }
+
+    if (sym == nullptr) {
+        // Symbol resolved to nullptr (unusual but possible)
+        patch__set_error("symbol '%s' resolved to nullptr", symbol);
+        if (library != nullptr && lib_handle != RTLD_DEFAULT) {
+            dlclose(lib_handle);
+        }
+        return PATCH_ERR_SYMBOL_NOT_FOUND;
+    }
+
+    // If we opened a library, we keep it open. The caller is responsible
+    // for the lifetime, or we could track it in the handle.
+    // For now, we leave it open since closing it would invalidate the symbol.
+
+    *address = sym;
+    return PATCH_SUCCESS;
+}
+
+patch_error_t
+patch_install_symbol(const char           *symbol,
+                     const char           *library,
+                     const patch_config_t *config,
+                     patch_handle_t      **handle)
+{
+    if (symbol == nullptr) {
+        patch__set_error("symbol must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+    if (config == nullptr) {
+        patch__set_error("config must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+    if (handle == nullptr) {
+        patch__set_error("handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    *handle = nullptr;
+
+    // Resolve the symbol
+    void         *target = nullptr;
+    patch_error_t err    = patch_resolve_symbol(symbol, library, &target);
+    if (err != PATCH_SUCCESS) {
+        return err;
+    }
+
+    // Create a copy of the config with the resolved target
+    patch_config_t resolved_config = *config;
+    resolved_config.target         = target;
+
+    // Install the patch
+    return patch_install(&resolved_config, handle);
 }

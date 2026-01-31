@@ -89,6 +89,9 @@ typedef enum {
 
     /** Internal error (bug in the library). */
     PATCH_ERR_INTERNAL,
+
+    /** Symbol not found in specified library or process. */
+    PATCH_ERR_SYMBOL_NOT_FOUND,
 } patch_error_t;
 
 /**
@@ -531,3 +534,84 @@ void patch_context_set_return(patch_context_t *ctx,
  * @endcode
  */
 [[nodiscard]] void *patch_get_trampoline(patch_handle_t *handle);
+
+/* =========================================================================
+ * Symbol Resolution API - For hooking by symbol name
+ * ========================================================================= */
+
+/**
+ * @brief Resolve a symbol to an address.
+ *
+ * Looks up a symbol by name in the specified library or the current process.
+ * This uses dlsym (POSIX) to perform the lookup.
+ *
+ * @param symbol  Symbol name to resolve.
+ * @param library Library path (nullptr for current process/all loaded libraries).
+ * @param address Output parameter receiving the symbol address.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_SYMBOL_NOT_FOUND if the symbol cannot be resolved,
+ *         PATCH_ERR_INVALID_ARGUMENT if symbol or address is nullptr.
+ *
+ * @code
+ * void *addr;
+ * if (patch_resolve_symbol("malloc", nullptr, &addr) == PATCH_SUCCESS) {
+ *     printf("malloc is at %p\n", addr);
+ * }
+ *
+ * // From a specific library
+ * if (patch_resolve_symbol("SSL_read", "libssl.so", &addr) == PATCH_SUCCESS) {
+ *     printf("SSL_read is at %p\n", addr);
+ * }
+ * @endcode
+ */
+[[nodiscard]] patch_error_t patch_resolve_symbol(const char *symbol,
+                                                 const char *library,
+                                                 void      **address);
+
+/**
+ * @brief Install a hook on a function by symbol name.
+ *
+ * Resolves the symbol to an address using dlsym and then installs the hook.
+ * This is a convenience function equivalent to:
+ *
+ * @code
+ * void *target;
+ * patch_resolve_symbol(symbol, library, &target);
+ * config.target = target;
+ * patch_install(&config, handle);
+ * @endcode
+ *
+ * @param symbol  Symbol name of the function to hook.
+ * @param library Library path containing the symbol (nullptr for current process).
+ * @param config  Configuration specifying callbacks (target field is ignored/overwritten).
+ * @param handle  Output parameter receiving the patch handle.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_SYMBOL_NOT_FOUND if the symbol cannot be resolved,
+ *         PATCH_ERR_INVALID_ARGUMENT if symbol, config, or handle is nullptr,
+ *         or other error codes from patch_install().
+ *
+ * @code
+ * bool my_prologue(patch_context_t *ctx, void *user_data) {
+ *     printf("malloc called!\n");
+ *     return true;
+ * }
+ *
+ * patch_config_t config = { .prologue = my_prologue };
+ * patch_handle_t *handle;
+ *
+ * patch_error_t err = patch_install_symbol("malloc", nullptr, &config, &handle);
+ * if (err == PATCH_SUCCESS) {
+ *     // malloc is now hooked
+ * }
+ * @endcode
+ *
+ * @note The library handle from dlopen (if library is specified) is kept
+ *       open for the lifetime of the patch. It is closed when patch_remove()
+ *       is called.
+ */
+[[nodiscard]] patch_error_t patch_install_symbol(const char          *symbol,
+                                                 const char          *library,
+                                                 const patch_config_t *config,
+                                                 patch_handle_t      **handle);
