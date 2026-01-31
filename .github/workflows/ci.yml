@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-linux-x64:
+    name: Linux x86-64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libffi-dev
+
+      - name: Enable hardware watchpoints
+        run: |
+          # Lower perf_event_paranoid to allow hardware watchpoints via perf_event_open
+          sudo sysctl kernel.perf_event_paranoid=-1
+          cat /proc/sys/kernel/perf_event_paranoid
+
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+
+      - name: Test
+        run: meson test -C build -v
+
+  test-linux-arm64:
+    name: Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libffi-dev
+
+      - name: Enable hardware watchpoints
+        run: |
+          sudo sysctl kernel.perf_event_paranoid=-1
+          cat /proc/sys/kernel/perf_event_paranoid
+
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+
+      - name: Test
+        run: meson test -C build -v
+
+  test-macos:
+    name: macOS ARM64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install meson ninja libffi
+
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+
+      - name: Test
+        run: meson test -C build -v
+
+  test-docker:
+    name: Docker (Linux x86-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test in Docker
+        run: |
+          docker build -t patch-test --target test .
+          docker run --rm --privileged patch-test

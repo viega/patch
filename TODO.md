@@ -29,7 +29,7 @@
 
 - [x] **vtable hooking** - Subsumed by watchpoint-guarded pointer hooks
 
-- [ ] **GitHub Actions CI** - Add workflow for automated testing on Linux (x86-64 and ARM64) with hardware watchpoint support via `sysctl kernel.perf_event_paranoid=-1`
+- [x] **GitHub Actions CI** - Add workflow for automated testing on Linux (x86-64 and ARM64) with hardware watchpoint support via `sysctl kernel.perf_event_paranoid=-1`
 
 - [ ] **Hook discovery** - Detect if a function is already hooked by another library
 
