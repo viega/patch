@@ -315,7 +315,7 @@ patch_error_t patch_enable(patch_handle_t *handle);
  * @endcode
  *
  * @note Only register arguments are accessible (6 on x86-64, 8 on ARM64).
- *       Stack arguments are not currently supported.
+ *       For additional arguments passed on the stack, use patch_context_get_stack_arg().
  */
 [[nodiscard]] void *patch_context_get_arg(patch_context_t *ctx, size_t index);
 
@@ -373,6 +373,48 @@ bool patch_context_set_arg(patch_context_t *ctx, size_t index, const void *value
  * @return true on success, false if index is out of range.
  */
 bool patch_context_set_fp_arg(patch_context_t *ctx, size_t index, const void *value, size_t size);
+
+/**
+ * @brief Get a stack argument by index.
+ *
+ * Returns a pointer to a function argument that was passed on the stack
+ * (beyond the register arguments). On x86-64 SysV ABI, stack arguments
+ * start after the 6 register arguments. On ARM64 AAPCS64, stack arguments
+ * start after the 8 register arguments.
+ *
+ * @param ctx   Context passed to the callback.
+ * @param index Zero-based stack argument index (0 = first stack arg).
+ *
+ * @return Pointer to the stack argument, or nullptr if ctx is nullptr.
+ *
+ * @code
+ * // For a function: void foo(int a, int b, int c, int d, int e, int f, int g)
+ * // On x86-64: a-f are in registers (index 0-5), g is on stack (index 0)
+ * bool my_prologue(patch_context_t *ctx, void *user_data) {
+ *     int *seventh_arg = (int *)patch_context_get_stack_arg(ctx, 0);
+ *     if (seventh_arg) {
+ *         printf("Seventh argument: %d\n", *seventh_arg);
+ *     }
+ *     return true;
+ * }
+ * @endcode
+ *
+ * @warning Stack arguments point directly into the caller's stack frame.
+ *          Modifying them affects the caller's memory. This is different
+ *          from register arguments which are copied into the context.
+ *
+ * @note The returned pointer is only valid during the prologue callback.
+ *       The epilogue callback receives a different stack pointer.
+ *
+ * @warning **Limitation**: If the prologue callback returns true (allowing
+ *          the original function to be called), stack arguments are NOT
+ *          forwarded to the original. Only register arguments are passed.
+ *          To handle functions with stack arguments, either:
+ *          1. Return false and compute/provide the result yourself, or
+ *          2. Use simple replacement mode with patch_get_trampoline() and
+ *             manually forward all arguments including stack arguments.
+ */
+[[nodiscard]] void *patch_context_get_stack_arg(patch_context_t *ctx, size_t index);
 
 /**
  * @brief Get the function's return value.

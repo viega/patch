@@ -51,6 +51,7 @@ struct patch_context {
     patch_handle_t  *handle;
     uint64_t         args[PATCH_REG_ARGS];        // Integer arguments
     patch__fp_reg_t  fp_args[PATCH_FP_REG_ARGS];  // Floating-point arguments
+    void            *caller_stack;                 // Pointer to caller's stack (for stack args)
     uint64_t         return_value;                 // Integer return value
     patch__fp_reg_t  fp_return_value;             // FP return value (xmm0/v0)
     bool             return_set;
@@ -70,9 +71,11 @@ void          patch__dispatcher_destroy(void *dispatcher);
 
 // Dispatch function called by generated dispatcher stub
 // fp_args points to saved FP registers (8 x 128-bit)
+// caller_stack points to the caller's stack frame (for accessing stack arguments)
 uint64_t patch__dispatch_full(patch_handle_t  *handle,
                               uint64_t        *args,
                               patch__fp_reg_t *fp_args,
+                              void            *caller_stack,
                               void            *trampoline);
 
 // Write the detour jump at target

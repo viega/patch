@@ -69,6 +69,14 @@ PATCH_DEFINE_HOOKABLE(void*, func_pointer_return, void *p)
     return p;
 }
 
+// Function with more than register args to test stack argument access
+// x86-64: 6 register args, so args 7+ are on stack
+// ARM64: 8 register args, so args 9+ are on stack
+PATCH_DEFINE_HOOKABLE(int, func_many_args, int a, int b, int c, int d, int e, int f, int g, int h, int i)
+{
+    return a + b + c + d + e + f + g + h + i;
+}
+
 // Note: Floating point functions removed - dispatcher only saves integer registers
 
 // ============================================================================
@@ -127,6 +135,55 @@ static bool dummy_prologue(patch_context_t *ctx, void *ud) {
     (void)ctx;
     (void)ud;
     return true;
+}
+
+// Captures stack arguments for verification
+static int g_captured_stack_args[4] = {0};
+static int g_captured_reg_args[8] = {0};
+
+static bool stack_arg_prologue(patch_context_t *ctx, void *ud) {
+    (void)ud;
+
+    // Capture register arguments for verification
+    for (int i = 0; i < PATCH_REG_ARGS; i++) {
+        int *arg = (int *)patch_context_get_arg(ctx, i);
+        if (arg) g_captured_reg_args[i] = *arg;
+    }
+
+    // On x86-64: args 0-5 are in registers, 6+ are on stack
+    // On ARM64: args 0-7 are in registers, 8+ are on stack
+    // Our function has 9 args (a-i), so:
+    //   x86-64: args g(6), h(7), i(8) are stack args 0, 1, 2
+    //   ARM64: arg i(8) is stack arg 0
+
+#ifdef PATCH_ARCH_X86_64
+    // Stack args: g=6, h=7, i=8 -> stack indices 0, 1, 2
+    int *stack_arg_0 = (int *)patch_context_get_stack_arg(ctx, 0);
+    int *stack_arg_1 = (int *)patch_context_get_stack_arg(ctx, 1);
+    int *stack_arg_2 = (int *)patch_context_get_stack_arg(ctx, 2);
+    if (stack_arg_0) g_captured_stack_args[0] = *stack_arg_0;
+    if (stack_arg_1) g_captured_stack_args[1] = *stack_arg_1;
+    if (stack_arg_2) g_captured_stack_args[2] = *stack_arg_2;
+
+    // Compute expected result and return it (skip original)
+    // This avoids the limitation that stack args aren't forwarded to trampoline
+    int sum = g_captured_reg_args[0] + g_captured_reg_args[1] + g_captured_reg_args[2] +
+              g_captured_reg_args[3] + g_captured_reg_args[4] + g_captured_reg_args[5] +
+              g_captured_stack_args[0] + g_captured_stack_args[1] + g_captured_stack_args[2];
+    patch_context_set_return(ctx, &sum, sizeof(sum));
+    return false;  // Skip original - we computed the result ourselves
+#else
+    // ARM64: arg i(8) is the only stack arg
+    int *stack_arg_0 = (int *)patch_context_get_stack_arg(ctx, 0);
+    if (stack_arg_0) g_captured_stack_args[0] = *stack_arg_0;
+
+    // Compute expected result
+    int sum = g_captured_reg_args[0] + g_captured_reg_args[1] + g_captured_reg_args[2] +
+              g_captured_reg_args[3] + g_captured_reg_args[4] + g_captured_reg_args[5] +
+              g_captured_reg_args[6] + g_captured_reg_args[7] + g_captured_stack_args[0];
+    patch_context_set_return(ctx, &sum, sizeof(sum));
+    return false;  // Skip original
+#endif
 }
 #endif
 
@@ -549,6 +606,92 @@ static void test_many_arguments(void)
     TEST_PASS();
 }
 
+#ifndef PATCH_PLATFORM_DARWIN
+static void test_stack_arguments(void)
+{
+    printf("Test: Stack argument access...\n");
+
+    // First verify the function works without hooks
+    // func_many_args(1,2,3,4,5,6,7,8,9) = 1+2+3+4+5+6+7+8+9 = 45
+    int result = PATCH_CALL(func_many_args, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+    assert(result == 45);
+
+    // Reset captured values
+    memset(g_captured_stack_args, 0, sizeof(g_captured_stack_args));
+    memset(g_captured_reg_args, 0, sizeof(g_captured_reg_args));
+
+    // Install a hook that captures stack arguments
+    patch_handle_t *handle = NULL;
+    patch_config_t config = {
+        .target = (void *)func_many_args,
+        .prologue = stack_arg_prologue,
+    };
+
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook func_many_args");
+        return;
+    }
+
+    // Call with identifiable values
+    // On x86-64: a-f (10-60) in registers, g-i (70-90) on stack
+    // On ARM64: a-h (10-80) in registers, i (90) on stack
+    result = PATCH_CALL(func_many_args, 10, 20, 30, 40, 50, 60, 70, 80, 90);
+
+    // The prologue computes the sum and returns it (skipping original)
+    if (result != 450) {
+        printf("  Expected result: 450, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("prologue didn't compute correct sum from captured args");
+        return;
+    }
+
+#ifdef PATCH_ARCH_X86_64
+    // Verify stack args were captured correctly
+    if (g_captured_stack_args[0] != 70 ||
+        g_captured_stack_args[1] != 80 ||
+        g_captured_stack_args[2] != 90) {
+        printf("  Expected stack args: 70, 80, 90\n");
+        printf("  Got: %d, %d, %d\n",
+               g_captured_stack_args[0],
+               g_captured_stack_args[1],
+               g_captured_stack_args[2]);
+        patch_remove(handle);
+        TEST_FAIL("stack arguments not captured correctly");
+        return;
+    }
+
+    // Verify register args too
+    if (g_captured_reg_args[0] != 10 || g_captured_reg_args[5] != 60) {
+        printf("  Register args not captured correctly\n");
+        patch_remove(handle);
+        TEST_FAIL("register arguments not captured correctly");
+        return;
+    }
+#else
+    // ARM64: only i(90) is on stack
+    if (g_captured_stack_args[0] != 90) {
+        printf("  Expected stack arg[0]: 90, got: %d\n", g_captured_stack_args[0]);
+        patch_remove(handle);
+        TEST_FAIL("stack argument not captured correctly");
+        return;
+    }
+
+    // Verify register args too
+    if (g_captured_reg_args[0] != 10 || g_captured_reg_args[7] != 80) {
+        printf("  Register args not captured correctly\n");
+        patch_remove(handle);
+        TEST_FAIL("register arguments not captured correctly");
+        return;
+    }
+#endif
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+#endif
+
 static void test_64bit_return_value(void)
 {
     printf("Test: 64-bit return value...\n");
@@ -721,6 +864,9 @@ int main(void)
     // Section 5: Data Types
     printf("\n--- Section 5: Data Types ---\n\n");
     test_many_arguments();
+#ifndef PATCH_PLATFORM_DARWIN
+    test_stack_arguments();
+#endif
     test_64bit_return_value();
     test_pointer_return_value();
 

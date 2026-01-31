@@ -15,14 +15,17 @@
 // Full dispatch function that handles prologue, trampoline call, and epilogue
 // This is called from the generated dispatcher stub
 // fp_args points to saved FP registers (8 x 128-bit = 128 bytes)
+// caller_stack points to the caller's stack frame (for accessing stack arguments)
 uint64_t
 patch__dispatch_full(patch_handle_t  *handle,
                      uint64_t        *args,
                      patch__fp_reg_t *fp_args,
+                     void            *caller_stack,
                      void            *trampoline)
 {
     patch_context_t ctx = {0};
     ctx.handle          = handle;
+    ctx.caller_stack    = caller_stack;
 
     // Copy integer arguments into context
     for (size_t i = 0; i < PATCH_REG_ARGS; i++) {
@@ -141,9 +144,15 @@ write_arm64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     // Note: FP args not actually saved, but we need to pass a valid pointer
     p[idx++] = 0x91014002;
 
-    // Load trampoline into x3: ldr x3, [pc, #offset]
+    // x3 = caller's stack pointer (sp + 256): add x3, sp, #256
+    // After stp [sp, #-256]!, original sp is at sp+256, which is where
+    // the caller's stack arguments begin
+    // Encoding: sf=1 opc=00 10001 shift=00 imm12=0x100 Rn=11111(sp) Rd=00011(x3)
+    p[idx++] = 0x910403E3;
+
+    // Load trampoline into x4: ldr x4, [pc, #offset]
     int64_t rel_tramp = (int64_t)tramp_off - (int64_t)(idx * 4);
-    p[idx++]          = 0x58000003 | (((rel_tramp / 4) & 0x7FFFF) << 5);
+    p[idx++]          = 0x58000004 | (((rel_tramp / 4) & 0x7FFFF) << 5);
 
     // Load dispatch function into x16: ldr x16, [pc, #offset]
     int64_t rel_func = (int64_t)func_off - (int64_t)(idx * 4);
@@ -307,7 +316,7 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
 
-    // Call patch__dispatch_full(handle, args, fp_args, trampoline)
+    // Call patch__dispatch_full(handle, args, fp_args, caller_stack, trampoline)
 
     // rdi = handle: movabs rdi, imm64
     code[idx++] = 0x48;
@@ -330,9 +339,19 @@ write_x86_64_dispatcher(uint8_t *code, patch_handle_t *handle, void *trampoline)
     code[idx++] = 0xFF;
     code[idx++] = 0xFF;
 
-    // rcx = trampoline: movabs rcx, imm64
+    // rcx = caller_stack: lea rcx, [rbp+16]
+    // After push rbp; mov rbp, rsp:
+    //   [rbp+0] = saved rbp
+    //   [rbp+8] = return address
+    //   [rbp+16] = first stack argument from caller
     code[idx++] = 0x48;
-    code[idx++] = 0xB9;
+    code[idx++] = 0x8D;
+    code[idx++] = 0x4D;
+    code[idx++] = 0x10;  // +16
+
+    // r8 = trampoline: movabs r8, imm64
+    code[idx++] = 0x49;
+    code[idx++] = 0xB8;
     memcpy(code + idx, &trampoline, 8);
     idx += 8;
 

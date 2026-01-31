@@ -328,6 +328,18 @@ patch_context_set_fp_arg(patch_context_t *ctx, size_t index, const void *value, 
 }
 
 void *
+patch_context_get_stack_arg(patch_context_t *ctx, size_t index)
+{
+    if (ctx == nullptr || ctx->caller_stack == nullptr) {
+        return nullptr;
+    }
+    // Stack arguments are 8-byte aligned slots
+    // The caller_stack pointer points to the first stack argument
+    uint64_t *stack = (uint64_t *)ctx->caller_stack;
+    return &stack[index];
+}
+
+void *
 patch_context_get_return(patch_context_t *ctx)
 {
     if (ctx == nullptr) {
