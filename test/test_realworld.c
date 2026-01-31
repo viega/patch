@@ -10,33 +10,23 @@
 // Real-world hooking tests
 //
 // These tests attempt to hook actual library functions to verify the patch
-// library works in realistic scenarios.
+// library works in realistic scenarios. Uses PATCH_METHOD_AUTO which tries
+// GOT hooking first, then falls back to code patching or breakpoints.
 // ============================================================================
-
-// ============================================================================
-// Tests that require code patching (Linux only)
-// ============================================================================
-
-#ifndef PATCH_PLATFORM_DARWIN
 
 // ============================================================================
 // Test 1: Hook atoi - simple libc function
 // ============================================================================
 
 static int g_atoi_call_count = 0;
+static int (*g_original_atoi)(const char *) = NULL;
 
-static bool
-atoi_prologue(patch_context_t *ctx, void *user_data)
+static int
+hooked_atoi(const char *str)
 {
-    (void)user_data;
     g_atoi_call_count++;
-
-    const char **str_ptr = (const char **)patch_context_get_arg(ctx, 0);
-    if (str_ptr && *str_ptr) {
-        printf("    atoi called with: \"%s\"\n", *str_ptr);
-    }
-
-    return true; // Continue to original
+    printf("    atoi called with: \"%s\"\n", str);
+    return g_original_atoi(str);
 }
 
 static void
@@ -44,31 +34,24 @@ test_hook_atoi(void)
 {
     printf("Test: Hook libc atoi()...\n");
 
-    // Get the address of atoi
-    void *atoi_addr = dlsym(RTLD_DEFAULT, "atoi");
-    if (atoi_addr == NULL) {
-        printf("  SKIPPED (could not find atoi)\n");
-        return;
-    }
-    printf("  atoi address: %p\n", atoi_addr);
-
-    // Check if we can install a hook
-    patch_error_t err = patch_can_install(atoi_addr);
-    if (err != PATCH_SUCCESS) {
-        printf("  SKIPPED (cannot hook atoi: %s)\n", patch_get_error_details());
-        return;
-    }
-
-    // Install the hook
     patch_config_t config = {
-        .target   = atoi_addr,
-        .prologue = atoi_prologue,
+        .replacement = (void *)hooked_atoi,
+        .method = PATCH_METHOD_AUTO,
     };
 
     patch_handle_t *handle = NULL;
-    err                    = patch_install(&config, &handle);
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
     if (err != PATCH_SUCCESS) {
         printf("  SKIPPED (install failed: %s)\n", patch_get_error_details());
+        return;
+    }
+
+    // Get original function pointer
+    g_original_atoi = (int (*)(const char *))patch_get_trampoline(handle);
+    if (g_original_atoi == NULL) {
+        printf("  SKIPPED (no trampoline available)\n");
+        patch_remove(handle);
         return;
     }
 
@@ -94,35 +77,86 @@ test_hook_atoi(void)
 }
 
 // ============================================================================
-// Test 2: Memory allocation tracking
+// Test 2: Hook strlen - very simple function
+// ============================================================================
+
+static int g_strlen_call_count = 0;
+static size_t (*g_original_strlen)(const char *) = NULL;
+
+static size_t
+hooked_strlen(const char *s)
+{
+    g_strlen_call_count++;
+    return g_original_strlen(s);
+}
+
+static void
+test_hook_strlen(void)
+{
+    printf("Test: Hook libc strlen()...\n");
+
+    patch_config_t config = {
+        .replacement = (void *)hooked_strlen,
+        .method = PATCH_METHOD_AUTO,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("strlen", NULL, &config, &handle);
+
+    if (err != PATCH_SUCCESS) {
+        printf("  SKIPPED (install failed: %s)\n", patch_get_error_details());
+        return;
+    }
+
+    g_original_strlen = (size_t (*)(const char *))patch_get_trampoline(handle);
+    if (g_original_strlen == NULL) {
+        printf("  SKIPPED (no trampoline available)\n");
+        patch_remove(handle);
+        return;
+    }
+
+    printf("  Hook installed!\n");
+    g_strlen_call_count = 0;
+
+    size_t l1 = strlen("hello");
+    size_t l2 = strlen("world!");
+    size_t l3 = strlen("");
+
+    printf("  Lengths: %zu, %zu, %zu\n", l1, l2, l3);
+    printf("  Hook called %d times\n", g_strlen_call_count);
+
+    if (g_strlen_call_count == 3 && l1 == 5 && l2 == 6 && l3 == 0) {
+        printf("  PASSED\n");
+    } else {
+        printf("  FAILED\n");
+    }
+
+    patch_remove(handle);
+}
+
+// ============================================================================
+// Test 3: Memory allocation tracking (malloc/free)
 // ============================================================================
 
 static size_t g_total_allocated   = 0;
-static size_t g_total_freed       = 0;
 static int    g_malloc_call_count = 0;
 static int    g_free_call_count   = 0;
+static void *(*g_original_malloc)(size_t) = NULL;
+static void (*g_original_free)(void *) = NULL;
 
-static bool
-malloc_prologue(patch_context_t *ctx, void *user_data)
+static void *
+hooked_malloc(size_t size)
 {
-    (void)user_data;
     g_malloc_call_count++;
-
-    size_t *size_ptr = (size_t *)patch_context_get_arg(ctx, 0);
-    if (size_ptr) {
-        g_total_allocated += *size_ptr;
-    }
-
-    return true;
+    g_total_allocated += size;
+    return g_original_malloc(size);
 }
 
-static bool
-free_prologue(patch_context_t *ctx, void *user_data)
+static void
+hooked_free(void *ptr)
 {
-    (void)user_data;
     g_free_call_count++;
-    (void)ctx; // We don't track the actual pointer/size for simplicity
-    return true;
+    g_original_free(ptr);
 }
 
 static void
@@ -130,55 +164,42 @@ test_track_allocations(void)
 {
     printf("Test: Track memory allocations...\n");
 
-    void *malloc_addr = dlsym(RTLD_DEFAULT, "malloc");
-    void *free_addr   = dlsym(RTLD_DEFAULT, "free");
-
-    if (malloc_addr == NULL || free_addr == NULL) {
-        printf("  SKIPPED (could not find malloc/free)\n");
-        return;
-    }
-
-    printf("  malloc address: %p\n", malloc_addr);
-    printf("  free address: %p\n", free_addr);
-
-    // Check if we can hook these
-    patch_error_t malloc_err = patch_can_install(malloc_addr);
-    patch_error_t free_err   = patch_can_install(free_addr);
-
-    if (malloc_err != PATCH_SUCCESS) {
-        printf("  Cannot hook malloc: %s\n", patch_get_error_details());
-    }
-    if (free_err != PATCH_SUCCESS) {
-        printf("  Cannot hook free: %s\n", patch_get_error_details());
-    }
-
-    if (malloc_err != PATCH_SUCCESS || free_err != PATCH_SUCCESS) {
-        printf("  SKIPPED (cannot hook malloc/free)\n");
-        return;
-    }
-
-    // Install hooks
     patch_config_t malloc_config = {
-        .target   = malloc_addr,
-        .prologue = malloc_prologue,
+        .replacement = (void *)hooked_malloc,
+        .method = PATCH_METHOD_AUTO,
     };
     patch_config_t free_config = {
-        .target   = free_addr,
-        .prologue = free_prologue,
+        .replacement = (void *)hooked_free,
+        .method = PATCH_METHOD_AUTO,
     };
 
     patch_handle_t *malloc_handle = NULL;
     patch_handle_t *free_handle   = NULL;
 
-    malloc_err = patch_install(&malloc_config, &malloc_handle);
+    patch_error_t malloc_err = patch_install_symbol("malloc", NULL, &malloc_config, &malloc_handle);
     if (malloc_err != PATCH_SUCCESS) {
-        printf("  SKIPPED (malloc hook install failed: %s)\n", patch_get_error_details());
+        printf("  SKIPPED (malloc hook failed: %s)\n", patch_get_error_details());
         return;
     }
 
-    free_err = patch_install(&free_config, &free_handle);
+    g_original_malloc = (void *(*)(size_t))patch_get_trampoline(malloc_handle);
+    if (g_original_malloc == NULL) {
+        printf("  SKIPPED (no malloc trampoline)\n");
+        patch_remove(malloc_handle);
+        return;
+    }
+
+    patch_error_t free_err = patch_install_symbol("free", NULL, &free_config, &free_handle);
     if (free_err != PATCH_SUCCESS) {
-        printf("  SKIPPED (free hook install failed: %s)\n", patch_get_error_details());
+        printf("  SKIPPED (free hook failed: %s)\n", patch_get_error_details());
+        patch_remove(malloc_handle);
+        return;
+    }
+
+    g_original_free = (void (*)(void *))patch_get_trampoline(free_handle);
+    if (g_original_free == NULL) {
+        printf("  SKIPPED (no free trampoline)\n");
+        patch_remove(free_handle);
         patch_remove(malloc_handle);
         return;
     }
@@ -187,7 +208,6 @@ test_track_allocations(void)
 
     // Reset counters
     g_total_allocated   = 0;
-    g_total_freed       = 0;
     g_malloc_call_count = 0;
     g_free_call_count   = 0;
 
@@ -215,72 +235,6 @@ test_track_allocations(void)
 }
 
 // ============================================================================
-// Test 3: Hook strlen - very simple function
-// ============================================================================
-
-static int g_strlen_call_count = 0;
-
-static bool
-strlen_prologue(patch_context_t *ctx, void *user_data)
-{
-    (void)user_data;
-    (void)ctx;
-    g_strlen_call_count++;
-    return true;
-}
-
-static void
-test_hook_strlen(void)
-{
-    printf("Test: Hook libc strlen()...\n");
-
-    void *strlen_addr = dlsym(RTLD_DEFAULT, "strlen");
-    if (strlen_addr == NULL) {
-        printf("  SKIPPED (could not find strlen)\n");
-        return;
-    }
-    printf("  strlen address: %p\n", strlen_addr);
-
-    patch_error_t err = patch_can_install(strlen_addr);
-    if (err != PATCH_SUCCESS) {
-        printf("  SKIPPED (cannot hook strlen: %s)\n", patch_get_error_details());
-        return;
-    }
-
-    patch_config_t config = {
-        .target   = strlen_addr,
-        .prologue = strlen_prologue,
-    };
-
-    patch_handle_t *handle = NULL;
-    err                    = patch_install(&config, &handle);
-    if (err != PATCH_SUCCESS) {
-        printf("  SKIPPED (install failed: %s)\n", patch_get_error_details());
-        return;
-    }
-
-    printf("  Hook installed!\n");
-    g_strlen_call_count = 0;
-
-    size_t l1 = strlen("hello");
-    size_t l2 = strlen("world!");
-    size_t l3 = strlen("");
-
-    printf("  Lengths: %zu, %zu, %zu\n", l1, l2, l3);
-    printf("  Hook called %d times\n", g_strlen_call_count);
-
-    if (g_strlen_call_count == 3 && l1 == 5 && l2 == 6 && l3 == 0) {
-        printf("  PASSED\n");
-    } else {
-        printf("  FAILED\n");
-    }
-
-    patch_remove(handle);
-}
-
-#endif // !PATCH_PLATFORM_DARWIN
-
-// ============================================================================
 // Test 4: Inspect prologue patterns of common functions
 // ============================================================================
 
@@ -295,9 +249,9 @@ inspect_function(const char *name)
 
     patch_error_t err = patch_can_install(addr);
     if (err == PATCH_SUCCESS) {
-        printf("  %-12s: %p - HOOKABLE\n", name, addr);
+        printf("  %-12s: %p - HOOKABLE (code)\n", name, addr);
     } else {
-        printf("  %-12s: %p - %s\n", name, addr, patch_get_error_details());
+        printf("  %-12s: %p - code: %s\n", name, addr, patch_get_error_details());
     }
 }
 
@@ -338,19 +292,17 @@ main(void)
     printf("=== Real-World Hooking Tests ===\n\n");
 
 #ifdef PATCH_PLATFORM_DARWIN
-    printf("Platform: macOS - code patching restricted by hardware W^X\n");
-    printf("These tests require low-level code patching and will be skipped.\n\n");
-
-    // On macOS, just inspect what functions look hookable
-    test_inspect_functions();
+    printf("Platform: macOS\n");
 #else
-    printf("Platform: Linux - full code patching support\n\n");
+    printf("Platform: Linux\n");
+#endif
+    printf("Using PATCH_METHOD_AUTO (GOT first, then code/breakpoint)\n\n");
 
-    // First, see what's hookable
+    // First, see what's hookable via code patching
     test_inspect_functions();
     printf("\n");
 
-    // Try to hook various functions
+    // Try to hook various functions using AUTO method
     test_hook_strlen();
     printf("\n");
 
@@ -359,7 +311,6 @@ main(void)
 
     // malloc/free is risky due to recursion, try last
     test_track_allocations();
-#endif
 
     printf("\n=== Real-World Tests Complete ===\n");
     return 0;

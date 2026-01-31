@@ -412,6 +412,13 @@ platform_find_got_entry(const char *symbol, void ***got_entry)
             continue;
         }
 
+        // Skip images in the dyld shared cache - their symbol table offsets
+        // are file offsets that don't work in memory. The MH_DYLIB_IN_CACHE
+        // flag (0x80000000) indicates this on macOS 11+.
+        if (header->flags & 0x80000000) {
+            continue;
+        }
+
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
 
         // Try each symbol pointer section type

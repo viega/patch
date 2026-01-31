@@ -13,12 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM/Clang 18 (C23 support)
+      - name: Install dependencies
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y clang-18 meson ninja-build libffi-dev
+          sudo apt-get install -y clang lld ninja-build libffi-dev pipx
+          pipx install meson
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Check versions
+        run: |
+          clang --version
+          meson --version
 
       - name: Enable hardware watchpoints
         run: |
@@ -27,7 +32,7 @@ jobs:
 
       - name: Build
         run: |
-          CC=clang-18 meson setup build
+          CC=clang meson setup build
           meson compile -C build
 
       - name: Test
@@ -39,12 +44,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM/Clang 18 (C23 support)
+      - name: Install dependencies
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-18 main" | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y clang-18 meson ninja-build libffi-dev
+          sudo apt-get install -y clang lld ninja-build libffi-dev pipx
+          pipx install meson
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Check versions
+        run: |
+          clang --version
+          meson --version
 
       - name: Enable hardware watchpoints
         run: |
@@ -53,7 +63,7 @@ jobs:
 
       - name: Build
         run: |
-          CC=clang-18 meson setup build
+          CC=clang meson setup build
           meson compile -C build
 
       - name: Test
@@ -67,11 +77,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install llvm@18 meson ninja libffi
+          brew install llvm meson ninja libffi
 
       - name: Build
         run: |
-          CC=$(brew --prefix llvm@18)/bin/clang meson setup build
+          CC=$(brew --prefix llvm)/bin/clang meson setup build
           meson compile -C build
 
       - name: Test
