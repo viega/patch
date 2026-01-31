@@ -884,3 +884,122 @@ try_code_patching:
     // Install the patch using code patching
     return patch_install(&resolved_config, handle);
 }
+
+// ============================================================================
+// Hot-Swap API
+// ============================================================================
+
+patch_error_t
+patch_set_prologue(patch_handle_t *handle, patch_prologue_fn prologue, void *user_data)
+{
+    if (handle == nullptr) {
+        patch__set_error("handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (handle->is_got_hook) {
+        patch__set_error("GOT hooks do not support prologue callbacks; use patch_set_replacement");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // Check if this is a dispatcher-based hook (has prologue/epilogue support)
+    if (handle->dispatcher == nullptr) {
+        patch__set_error("simple replacement hooks do not support prologue callbacks");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // Atomic update - the dispatcher reads these at call time
+    // Use atomic stores to ensure visibility across threads
+    atomic_store((_Atomic(void *) *)&handle->prologue_user_data, user_data);
+    atomic_store((_Atomic(patch_prologue_fn) *)&handle->prologue, prologue);
+
+    return PATCH_SUCCESS;
+}
+
+patch_error_t
+patch_set_epilogue(patch_handle_t *handle, patch_epilogue_fn epilogue, void *user_data)
+{
+    if (handle == nullptr) {
+        patch__set_error("handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (handle->is_got_hook) {
+        patch__set_error("GOT hooks do not support epilogue callbacks; use patch_set_replacement");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (handle->dispatcher == nullptr) {
+        patch__set_error("simple replacement hooks do not support epilogue callbacks");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // Atomic update
+    atomic_store((_Atomic(void *) *)&handle->epilogue_user_data, user_data);
+    atomic_store((_Atomic(patch_epilogue_fn) *)&handle->epilogue, epilogue);
+
+    return PATCH_SUCCESS;
+}
+
+patch_error_t
+patch_set_callbacks(patch_handle_t   *handle,
+                    patch_prologue_fn prologue,
+                    void             *prologue_data,
+                    patch_epilogue_fn epilogue,
+                    void             *epilogue_data)
+{
+    if (handle == nullptr) {
+        patch__set_error("handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (handle->is_got_hook) {
+        patch__set_error("GOT hooks do not support callbacks; use patch_set_replacement");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (handle->dispatcher == nullptr) {
+        patch__set_error("simple replacement hooks do not support callbacks");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // Update all four fields atomically (in terms of visibility)
+    // Note: This is not a single atomic operation, but the dispatcher
+    // will see a consistent state because it reads prologue before
+    // prologue_user_data, and epilogue before epilogue_user_data.
+    // We update user_data first, then the callback pointer.
+    atomic_store((_Atomic(void *) *)&handle->prologue_user_data, prologue_data);
+    atomic_store((_Atomic(patch_prologue_fn) *)&handle->prologue, prologue);
+    atomic_store((_Atomic(void *) *)&handle->epilogue_user_data, epilogue_data);
+    atomic_store((_Atomic(patch_epilogue_fn) *)&handle->epilogue, epilogue);
+
+    return PATCH_SUCCESS;
+}
+
+patch_error_t
+patch_set_replacement(patch_handle_t *handle, void *replacement)
+{
+    if (handle == nullptr) {
+        patch__set_error("handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (replacement == nullptr) {
+        patch__set_error("replacement must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!handle->is_got_hook) {
+        patch__set_error("patch_set_replacement only works for GOT hooks; "
+                         "use patch_remove + patch_install for code-patched hooks");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // For GOT hooks, just update the GOT entry
+    if (handle->got_entry != nullptr) {
+        *handle->got_entry = replacement;
+        handle->detour_dest = replacement;
+    }
+
+    return PATCH_SUCCESS;
+}

@@ -1476,6 +1476,293 @@ static void test_got_method_auto(void)
     patch_remove(handle);
     TEST_PASS();
 }
+
+// ============================================================================
+// Section 10: Hot-Swap Hooks
+// ============================================================================
+
+// Trackers for hot-swap test
+static int g_hotswap_prologue_v1_calls = 0;
+static int g_hotswap_prologue_v2_calls = 0;
+static int g_hotswap_epilogue_v1_calls = 0;
+static int g_hotswap_epilogue_v2_calls = 0;
+
+static bool hotswap_prologue_v1(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    g_hotswap_prologue_v1_calls++;
+    return true;
+}
+
+static bool hotswap_prologue_v2(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    g_hotswap_prologue_v2_calls++;
+    return true;
+}
+
+static void hotswap_epilogue_v1(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    g_hotswap_epilogue_v1_calls++;
+}
+
+static void hotswap_epilogue_v2(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    g_hotswap_epilogue_v2_calls++;
+}
+
+static void test_hot_swap_prologue(void)
+{
+    printf("Test: Hot-swap prologue callback...\n");
+
+    // Reset counters
+    g_hotswap_prologue_v1_calls = 0;
+    g_hotswap_prologue_v2_calls = 0;
+
+    // Install hook with prologue v1
+    patch_config_t config = {
+        .target = (void *)func_identity,
+        .prologue = hotswap_prologue_v1,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("cannot hook func_identity");
+        return;
+    }
+
+    // Call a few times - v1 should be called
+    PATCH_CALL(func_identity, 1);
+    PATCH_CALL(func_identity, 2);
+    assert(g_hotswap_prologue_v1_calls == 2);
+    assert(g_hotswap_prologue_v2_calls == 0);
+
+    // Hot-swap to v2
+    err = patch_set_prologue(handle, hotswap_prologue_v2, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    // Now v2 should be called
+    PATCH_CALL(func_identity, 3);
+    PATCH_CALL(func_identity, 4);
+    assert(g_hotswap_prologue_v1_calls == 2);  // No change
+    assert(g_hotswap_prologue_v2_calls == 2);
+
+    // Hot-swap back to v1
+    err = patch_set_prologue(handle, hotswap_prologue_v1, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    PATCH_CALL(func_identity, 5);
+    assert(g_hotswap_prologue_v1_calls == 3);
+    assert(g_hotswap_prologue_v2_calls == 2);
+
+    // Hot-swap to NULL (disable prologue)
+    err = patch_set_prologue(handle, NULL, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    PATCH_CALL(func_identity, 6);
+    assert(g_hotswap_prologue_v1_calls == 3);  // No change
+    assert(g_hotswap_prologue_v2_calls == 2);  // No change
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_hot_swap_epilogue(void)
+{
+    printf("Test: Hot-swap epilogue callback...\n");
+
+    // Reset counters
+    g_hotswap_epilogue_v1_calls = 0;
+    g_hotswap_epilogue_v2_calls = 0;
+
+    // Install hook with epilogue v1
+    patch_config_t config = {
+        .target = (void *)func_identity,
+        .prologue = hotswap_prologue_v1,  // Need a prologue to have a dispatcher
+        .epilogue = hotswap_epilogue_v1,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("cannot hook func_identity");
+        return;
+    }
+
+    // Call - v1 should be called
+    PATCH_CALL(func_identity, 1);
+    assert(g_hotswap_epilogue_v1_calls == 1);
+    assert(g_hotswap_epilogue_v2_calls == 0);
+
+    // Hot-swap to v2
+    err = patch_set_epilogue(handle, hotswap_epilogue_v2, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    // Now v2 should be called
+    PATCH_CALL(func_identity, 2);
+    assert(g_hotswap_epilogue_v1_calls == 1);  // No change
+    assert(g_hotswap_epilogue_v2_calls == 1);
+
+    // Hot-swap to NULL (disable epilogue)
+    err = patch_set_epilogue(handle, NULL, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    PATCH_CALL(func_identity, 3);
+    assert(g_hotswap_epilogue_v1_calls == 1);  // No change
+    assert(g_hotswap_epilogue_v2_calls == 1);  // No change
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_hot_swap_callbacks(void)
+{
+    printf("Test: Hot-swap both callbacks atomically...\n");
+
+    // Reset counters
+    g_hotswap_prologue_v1_calls = 0;
+    g_hotswap_prologue_v2_calls = 0;
+    g_hotswap_epilogue_v1_calls = 0;
+    g_hotswap_epilogue_v2_calls = 0;
+
+    // Install hook with v1 callbacks
+    patch_config_t config = {
+        .target = (void *)func_identity,
+        .prologue = hotswap_prologue_v1,
+        .epilogue = hotswap_epilogue_v1,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("cannot hook func_identity");
+        return;
+    }
+
+    // Call - v1 for both
+    PATCH_CALL(func_identity, 1);
+    assert(g_hotswap_prologue_v1_calls == 1);
+    assert(g_hotswap_epilogue_v1_calls == 1);
+
+    // Hot-swap both to v2
+    err = patch_set_callbacks(handle,
+                              hotswap_prologue_v2, NULL,
+                              hotswap_epilogue_v2, NULL);
+    assert(err == PATCH_SUCCESS);
+
+    // Now v2 for both
+    PATCH_CALL(func_identity, 2);
+    assert(g_hotswap_prologue_v1_calls == 1);  // No change
+    assert(g_hotswap_epilogue_v1_calls == 1);  // No change
+    assert(g_hotswap_prologue_v2_calls == 1);
+    assert(g_hotswap_epilogue_v2_calls == 1);
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_hot_swap_invalid(void)
+{
+    printf("Test: Hot-swap with invalid arguments...\n");
+
+    patch_error_t err;
+
+    // Null handle
+    err = patch_set_prologue(NULL, hotswap_prologue_v1, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    err = patch_set_epilogue(NULL, hotswap_epilogue_v1, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    err = patch_set_callbacks(NULL, hotswap_prologue_v1, NULL,
+                              hotswap_epilogue_v1, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    err = patch_set_replacement(NULL, (void *)hook_add_1000);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    TEST_PASS();
+}
+
+// Test hot-swap replacement for GOT hooks
+static int g_got_hotswap_v1_calls = 0;
+static int g_got_hotswap_v2_calls = 0;
+static int (*g_got_original_atoi_hotswap)(const char *) = NULL;
+
+static int got_hotswap_v1(const char *str)
+{
+    g_got_hotswap_v1_calls++;
+    return g_got_original_atoi_hotswap(str) + 100;
+}
+
+static int got_hotswap_v2(const char *str)
+{
+    g_got_hotswap_v2_calls++;
+    return g_got_original_atoi_hotswap(str) + 200;
+}
+
+static void test_hot_swap_got_replacement(void)
+{
+    printf("Test: Hot-swap GOT replacement function...\n");
+
+    g_got_hotswap_v1_calls = 0;
+    g_got_hotswap_v2_calls = 0;
+
+    patch_config_t config = {
+        .replacement = (void *)got_hotswap_v1,
+        .method = PATCH_METHOD_GOT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
+    if (err == PATCH_ERR_NO_GOT_ENTRY) {
+        TEST_SKIP("no GOT entry for atoi");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("cannot hook atoi via GOT");
+        return;
+    }
+
+    g_got_original_atoi_hotswap = (int (*)(const char *))patch_get_trampoline(handle);
+
+    // Call - v1 should be active
+    int result = atoi("10");
+    assert(result == 110);  // 10 + 100
+    assert(g_got_hotswap_v1_calls == 1);
+    assert(g_got_hotswap_v2_calls == 0);
+
+    // Hot-swap to v2
+    err = patch_set_replacement(handle, (void *)got_hotswap_v2);
+    assert(err == PATCH_SUCCESS);
+
+    // Now v2 should be active
+    result = atoi("10");
+    assert(result == 210);  // 10 + 200
+    assert(g_got_hotswap_v1_calls == 1);  // No change
+    assert(g_got_hotswap_v2_calls == 1);
+
+    // Hot-swap back to v1
+    err = patch_set_replacement(handle, (void *)got_hotswap_v1);
+    assert(err == PATCH_SUCCESS);
+
+    result = atoi("10");
+    assert(result == 110);
+    assert(g_got_hotswap_v1_calls == 2);
+    assert(g_got_hotswap_v2_calls == 1);
+
+    patch_remove(handle);
+    TEST_PASS();
+}
 #endif
 
 // ============================================================================
@@ -1603,6 +1890,27 @@ int main(void)
     printf("Test: GOT hooking disable/enable...\n");
     TEST_SKIP("GOT hooking not available on macOS");
     printf("Test: GOT hooking with AUTO method...\n");
+    TEST_SKIP("GOT hooking not available on macOS");
+#endif
+
+    // Section 10: Hot-Swap Hooks
+    printf("\n--- Section 10: Hot-Swap Hooks ---\n\n");
+#ifndef PATCH_PLATFORM_DARWIN
+    test_hot_swap_prologue();
+    test_hot_swap_epilogue();
+    test_hot_swap_callbacks();
+    test_hot_swap_invalid();
+    test_hot_swap_got_replacement();
+#else
+    printf("Test: Hot-swap prologue callback...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Hot-swap epilogue callback...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Hot-swap both callbacks atomically...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Hot-swap with invalid arguments...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Hot-swap GOT replacement function...\n");
     TEST_SKIP("GOT hooking not available on macOS");
 #endif
 

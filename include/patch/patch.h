@@ -649,3 +649,93 @@ void patch_context_set_return(patch_context_t *ctx,
                                                  const char          *library,
                                                  const patch_config_t *config,
                                                  patch_handle_t      **handle);
+
+/* =========================================================================
+ * Hot-Swap API - Change callbacks without removing the hook
+ * ========================================================================= */
+
+/**
+ * @brief Change a hook's prologue callback without removing the hook.
+ *
+ * Atomically updates the prologue callback. There is no window where calls
+ * bypass the hook - the old callback handles calls until the exact moment
+ * the new one takes over.
+ *
+ * @param handle    Handle returned by patch_install().
+ * @param prologue  New prologue callback (may be nullptr to disable).
+ * @param user_data New user data for the prologue callback.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr,
+ *         PATCH_ERR_INVALID_ARGUMENT if this is a GOT hook (use replacement mode).
+ *
+ * @code
+ * // Change logging level without missing any calls
+ * patch_set_prologue(handle, verbose_logging ? detailed_log : brief_log, NULL);
+ * @endcode
+ *
+ * @note Only valid for hooks installed with prologue/epilogue callbacks,
+ *       not for simple replacement mode or GOT hooks.
+ */
+patch_error_t patch_set_prologue(patch_handle_t   *handle,
+                                 patch_prologue_fn prologue,
+                                 void             *user_data);
+
+/**
+ * @brief Change a hook's epilogue callback without removing the hook.
+ *
+ * Atomically updates the epilogue callback.
+ *
+ * @param handle    Handle returned by patch_install().
+ * @param epilogue  New epilogue callback (may be nullptr to disable).
+ * @param user_data New user data for the epilogue callback.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr,
+ *         PATCH_ERR_INVALID_ARGUMENT if this is a GOT hook.
+ *
+ * @note Only valid for hooks installed with prologue/epilogue callbacks.
+ */
+patch_error_t patch_set_epilogue(patch_handle_t   *handle,
+                                 patch_epilogue_fn epilogue,
+                                 void             *user_data);
+
+/**
+ * @brief Change both prologue and epilogue callbacks atomically.
+ *
+ * Updates both callbacks in a single operation. Useful when the callbacks
+ * depend on each other and must be updated together.
+ *
+ * @param handle          Handle returned by patch_install().
+ * @param prologue        New prologue callback (may be nullptr).
+ * @param prologue_data   New user data for prologue.
+ * @param epilogue        New epilogue callback (may be nullptr).
+ * @param epilogue_data   New user data for epilogue.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_INVALID_ARGUMENT if handle is nullptr,
+ *         PATCH_ERR_INVALID_ARGUMENT if this is a GOT hook.
+ */
+patch_error_t patch_set_callbacks(patch_handle_t   *handle,
+                                  patch_prologue_fn prologue,
+                                  void             *prologue_data,
+                                  patch_epilogue_fn epilogue,
+                                  void             *epilogue_data);
+
+/**
+ * @brief Change a GOT hook's replacement function.
+ *
+ * For GOT hooks, atomically updates the replacement function pointer.
+ * The old function handles calls until the exact moment the new one takes over.
+ *
+ * @param handle      Handle returned by patch_install() with PATCH_METHOD_GOT.
+ * @param replacement New replacement function.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_INVALID_ARGUMENT if handle or replacement is nullptr,
+ *         PATCH_ERR_INVALID_ARGUMENT if this is not a GOT hook.
+ *
+ * @note Only valid for GOT hooks. For code-patched hooks, you must use
+ *       patch_remove() and patch_install() to change the replacement.
+ */
+patch_error_t patch_set_replacement(patch_handle_t *handle, void *replacement);

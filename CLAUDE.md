@@ -584,6 +584,40 @@ patch_config_t config = {
 - Does not support prologue/epilogue callbacks (replacement only)
 - Per-module (each shared object has its own GOT)
 
+## Hot-Swap Hooks
+
+Callbacks can be changed while a hook is active without removing and reinstalling:
+
+```c
+// Install hook with initial callbacks
+patch_config_t config = {
+    .target = (void *)func,
+    .prologue = prologue_v1,
+    .epilogue = epilogue_v1,
+};
+patch_install(&config, &handle);
+
+// Later, swap to new callbacks without reinstalling
+patch_set_prologue(handle, prologue_v2, user_data);
+patch_set_epilogue(handle, epilogue_v2, user_data);
+
+// Or swap both atomically
+patch_set_callbacks(handle, prologue_v2, p_data, epilogue_v2, e_data);
+
+// For GOT hooks, swap the replacement function
+patch_set_replacement(handle, new_replacement);
+```
+
+**Hot-swap API:**
+- `patch_set_prologue(handle, prologue, user_data)` — Replace prologue callback
+- `patch_set_epilogue(handle, epilogue, user_data)` — Replace epilogue callback
+- `patch_set_callbacks(handle, prologue, p_data, epilogue, e_data)` — Replace both
+- `patch_set_replacement(handle, replacement)` — Replace GOT hook target (GOT hooks only)
+
+Setting a callback to `NULL` disables that callback without removing the hook.
+
+**Thread safety:** Updates are performed using atomic stores, so no calls will see partially updated state. However, there is no synchronization guarantee about which callback a concurrent call will use.
+
 ## Code Style
 
 - Public symbols: `patch_` prefix

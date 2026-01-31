@@ -23,7 +23,7 @@
 
 - [ ] **Conditional hooks** - Only trigger callback when arguments match a predicate
 
-- [ ] **Hot-swap hooks** - Replace a hook's callbacks without remove/reinstall cycle
+- [x] **Hot-swap hooks** - Replace a hook's callbacks without remove/reinstall cycle
 
 - [ ] **vtable hooking** - Hook C++ virtual methods by patching vtables
 
