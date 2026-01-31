@@ -1026,19 +1026,24 @@ patch_install_symbol(const char           *symbol,
     }
 
 try_code_patching:
-    // Use code patching
+    // Use code patching (with breakpoint fallback if AUTO)
     if (method == PATCH_METHOD_GOT) {
         // Should not reach here - GOT-only mode but no GOT entry
         patch__set_error("no GOT entry found for symbol '%s'", symbol);
         return PATCH_ERR_NO_GOT_ENTRY;
     }
 
-    // Create a copy of the config with the resolved target and force CODE method
+    // Create a copy of the config with the resolved target
+    // Preserve AUTO method so breakpoint fallback works if code patching fails
     patch_config_t resolved_config = *config;
     resolved_config.target         = target;
-    resolved_config.method         = PATCH_METHOD_CODE;
+    if (method == PATCH_METHOD_AUTO) {
+        resolved_config.method = PATCH_METHOD_AUTO;  // Preserve for breakpoint fallback
+    } else {
+        resolved_config.method = PATCH_METHOD_CODE;
+    }
 
-    // Install the patch using code patching
+    // Install the patch using code patching (may fall back to breakpoints if AUTO)
     return patch_install(&resolved_config, handle);
 }
 
