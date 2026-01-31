@@ -5,6 +5,7 @@
 #include "futex.h"
 #include "pattern/pattern.h"
 #include "platform/platform.h"
+#include "watchpoint.h"
 
 #include <dlfcn.h>
 #include <stdarg.h>
@@ -537,6 +538,19 @@ patch_remove(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
+    // Handle watchpoint hooks specially
+    if (handle->is_watchpoint_hook) {
+        patch_error_t err = patch__watchpoint_remove(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+
+        free(handle);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
     // Code patching path below
 
     // Check if this is the first hook in the chain (the one the detour points to)
@@ -634,6 +648,18 @@ patch_disable(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
+    // Handle watchpoint hooks specially
+    if (handle->is_watchpoint_hook) {
+        patch_error_t err = patch__watchpoint_disable(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+        atomic_store(&handle->enabled, false);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
     // Restore original bytes (code patching)
     patch_error_t err = patch__restore_bytes(handle->target,
                                              handle->original_bytes,
@@ -678,6 +704,18 @@ patch_enable(patch_handle_t *handle)
     // Handle breakpoint hooks specially
     if (handle->is_breakpoint_hook) {
         patch_error_t err = patch__breakpoint_enable(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+        atomic_store(&handle->enabled, true);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // Handle watchpoint hooks specially
+    if (handle->is_watchpoint_hook) {
+        patch_error_t err = patch__watchpoint_enable(handle);
         if (err != PATCH_SUCCESS) {
             futex_mutex_unlock(&g_patch_mutex);
             return err;
@@ -798,8 +836,8 @@ patch_get_trampoline(patch_handle_t *handle)
         return nullptr;
     }
 
-    // For GOT hooks, return the original function pointer
-    if (handle->is_got_hook) {
+    // For GOT hooks and watchpoint hooks, return the original function pointer
+    if (handle->is_got_hook || handle->is_watchpoint_hook) {
         return handle->original_got_value;
     }
 
@@ -1120,5 +1158,58 @@ patch_set_replacement(patch_handle_t *handle, void *replacement)
         handle->detour_dest = replacement;
     }
 
+    return PATCH_SUCCESS;
+}
+
+// ============================================================================
+// Watchpoint-Guarded Pointer Hooks
+// ============================================================================
+
+patch_error_t
+patch_install_pointer(const patch_pointer_config_t *config, patch_handle_t **handle)
+{
+    if (config == nullptr || handle == nullptr) {
+        patch__set_error("config and handle must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    *handle = nullptr;
+
+    if (config->location == nullptr) {
+        patch__set_error("config->location must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (config->replacement == nullptr) {
+        patch__set_error("config->replacement must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    // Create handle
+    patch_handle_t *h = calloc(1, sizeof(*h));
+    if (h == nullptr) {
+        patch__set_error("failed to allocate patch handle");
+        return PATCH_ERR_ALLOCATION_FAILED;
+    }
+
+    h->watched_location = config->location;
+    h->detour_dest      = config->replacement;
+    h->watch_callback   = config->on_update;
+    h->watch_user_data  = config->user_data;
+    atomic_store(&h->enabled, true);
+
+    futex_mutex_lock(&g_patch_mutex);
+
+    // Install the watchpoint hook
+    patch_error_t err = patch__watchpoint_install(h);
+    if (err != PATCH_SUCCESS) {
+        futex_mutex_unlock(&g_patch_mutex);
+        free(h);
+        return err;
+    }
+
+    futex_mutex_unlock(&g_patch_mutex);
+
+    *handle = h;
     return PATCH_SUCCESS;
 }

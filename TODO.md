@@ -25,7 +25,9 @@
 
 - [x] **Hot-swap hooks** - Replace a hook's callbacks without remove/reinstall cycle
 
-- [ ] **vtable hooking** - Hook C++ virtual methods by patching vtables
+- [ ] **Watchpoint-guarded pointer hooks** - Hook function pointers (vtables, callbacks, GOT entries) with hardware watchpoint protection. When the program updates the pointer, automatically reinstall the detour and cache the new original. Uses debug registers (DR0-DR3 on x86-64, DBGWVR on ARM64). Returns error when watchpoints exhausted (no slow fallback).
+
+- [x] **vtable hooking** - Subsumed by watchpoint-guarded pointer hooks
 
 - [ ] **Hook discovery** - Detect if a function is already hooked by another library
 

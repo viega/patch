@@ -7,12 +7,19 @@
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <link.h>
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 // MAP_FIXED_NOREPLACE was added in Linux 4.17 / glibc 2.27
@@ -384,4 +391,149 @@ platform_find_got_entry(const char *symbol, void ***got_entry)
 
     patch__set_error("no GOT entry found for symbol '%s'", symbol);
     return PATCH_ERR_NO_GOT_ENTRY;
+}
+
+// =============================================================================
+// Hardware Watchpoint Support
+// =============================================================================
+//
+// Linux provides hardware watchpoints via perf_event_open() with
+// PERF_TYPE_BREAKPOINT. This is more ergonomic than ptrace for self-monitoring.
+// The watchpoint generates SIGTRAP when triggered.
+
+// Track watchpoint state
+static atomic_int g_watchpoint_in_use[PLATFORM_MAX_WATCHPOINTS] = {0};
+static void      *g_watchpoint_addr[PLATFORM_MAX_WATCHPOINTS]   = {0};
+static int        g_watchpoint_fd[PLATFORM_MAX_WATCHPOINTS]     = {-1, -1, -1, -1};
+
+// Helper to make perf_event_open syscall
+static long
+perf_event_open(struct perf_event_attr *attr,
+                pid_t                   pid,
+                int                     cpu,
+                int                     group_fd,
+                unsigned long           flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+int
+platform_set_watchpoint(void *addr, size_t size, watchpoint_type_t type)
+{
+    // Validate size
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        patch__set_error("watchpoint size must be 1, 2, 4, or 8");
+        return -1;
+    }
+
+    // Find a free slot
+    int slot = -1;
+    for (int i = 0; i < PLATFORM_MAX_WATCHPOINTS; i++) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&g_watchpoint_in_use[i], &expected, 1)) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        patch__set_error("all hardware watchpoints are in use");
+        return -1;
+    }
+
+    // Configure perf event for hardware breakpoint/watchpoint
+    struct perf_event_attr pe;
+    memset(&pe, 0, sizeof(pe));
+
+    pe.type           = PERF_TYPE_BREAKPOINT;
+    pe.size           = sizeof(pe);
+    pe.bp_type        = (type == WATCHPOINT_WRITE) ? HW_BREAKPOINT_W : HW_BREAKPOINT_RW;
+    pe.bp_addr        = (unsigned long)addr;
+    pe.bp_len         = size;
+    pe.disabled       = 0;
+    pe.exclude_kernel = 1;
+    pe.exclude_hv     = 1;
+
+    // Signal configuration
+    pe.sigtrap        = 1; // Generate SIGTRAP on hit
+    pe.remove_on_exec = 1; // Auto-remove on exec
+
+    // Open perf event (pid=0 means current process, cpu=-1 means any CPU)
+    int fd = (int)perf_event_open(&pe, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) {
+        atomic_store(&g_watchpoint_in_use[slot], 0);
+        patch__set_error("perf_event_open failed for watchpoint (errno=%d)", errno);
+        return -1;
+    }
+
+    // Store state
+    g_watchpoint_fd[slot]   = fd;
+    g_watchpoint_addr[slot] = addr;
+
+    return slot;
+}
+
+patch_error_t
+platform_clear_watchpoint(int watchpoint_id)
+{
+    if (watchpoint_id < 0 || watchpoint_id >= PLATFORM_MAX_WATCHPOINTS) {
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!atomic_load(&g_watchpoint_in_use[watchpoint_id])) {
+        return PATCH_SUCCESS; // Already cleared
+    }
+
+    // Close the perf event fd
+    if (g_watchpoint_fd[watchpoint_id] >= 0) {
+        close(g_watchpoint_fd[watchpoint_id]);
+        g_watchpoint_fd[watchpoint_id] = -1;
+    }
+
+    g_watchpoint_addr[watchpoint_id] = nullptr;
+    atomic_store(&g_watchpoint_in_use[watchpoint_id], 0);
+
+    return PATCH_SUCCESS;
+}
+
+int
+platform_check_watchpoint_hit(void *ucontext)
+{
+    (void)ucontext;
+
+    // On Linux with perf events, we need to check siginfo for the source
+    // Since perf watchpoints generate SIGTRAP, and we're called from a signal
+    // handler, we need to figure out which watchpoint fired.
+
+    // The siginfo_t passed to the handler contains si_addr for the faulting address.
+    // However, we don't have access to siginfo here. For now, we check
+    // which watchpoint address matches the fault address from ucontext.
+
+    // On x86-64, we can check DR6 (but not easily accessible from userspace)
+    // On ARM64, check FAR from ucontext
+
+    // Simpler approach: since perf events are per-address, and we're in
+    // a signal handler for SIGTRAP, check if any of our watchpoints
+    // could have triggered by comparing addresses.
+
+    // For now, return the first active watchpoint (caller should verify)
+    for (int i = 0; i < PLATFORM_MAX_WATCHPOINTS; i++) {
+        if (atomic_load(&g_watchpoint_in_use[i])) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+void *
+platform_get_watchpoint_addr(void *ucontext, int watchpoint_id)
+{
+    (void)ucontext;
+
+    if (watchpoint_id < 0 || watchpoint_id >= PLATFORM_MAX_WATCHPOINTS) {
+        return nullptr;
+    }
+
+    return g_watchpoint_addr[watchpoint_id];
 }

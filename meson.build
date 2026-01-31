@@ -51,6 +51,7 @@ lib_sources = [
     'src/trampoline.c',
     'src/dispatcher.c',
     'src/breakpoint.c',
+    'src/watchpoint.c',
     'src/pattern/registry.c',
 ] + arch_sources + platform_sources
 

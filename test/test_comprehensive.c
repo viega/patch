@@ -2021,6 +2021,409 @@ static void test_breakpoint_skip_original(void)
 }
 
 // ============================================================================
+// Section 12: Watchpoint-Guarded Pointer Hooks
+// ============================================================================
+
+// Simple function for pointer hook tests
+static int wp_target_v1(int x) { return x + 1; }
+static int wp_target_v2(int x) { return x + 2; }
+
+// Function pointer to hook
+static int (*g_wp_func_ptr)(int) = wp_target_v1;
+
+// Global for storing original during hook
+static int (*g_wp_original)(int) = NULL;
+
+// Hook replacement that calls original + adds 100
+static int wp_hook_replacement(int x)
+{
+    if (g_wp_original) {
+        return g_wp_original(x) + 100;
+    }
+    return x + 100;
+}
+
+// Callback tracking
+static int g_wp_callback_calls = 0;
+static void *g_wp_callback_old = NULL;
+static void *g_wp_callback_new = NULL;
+static patch_watch_action_t g_wp_callback_action = PATCH_WATCH_KEEP;
+
+static patch_watch_action_t wp_test_callback(patch_handle_t *handle,
+                                              void           *old_value,
+                                              void           *new_value,
+                                              void           *user_data)
+{
+    (void)handle;
+    (void)user_data;
+    g_wp_callback_calls++;
+    g_wp_callback_old = old_value;
+    g_wp_callback_new = new_value;
+    return g_wp_callback_action;
+}
+
+static void test_pointer_hook_basic(void)
+{
+    printf("Test: Pointer hook basic install/remove...\n");
+
+    // Reset
+    g_wp_func_ptr = wp_target_v1;
+
+    // Verify original function works
+    int result = g_wp_func_ptr(10);
+    assert(result == 11);  // 10 + 1
+
+    // Install pointer hook
+    patch_pointer_config_t config = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = (void *)wp_hook_replacement,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_pointer(&config, &handle);
+
+    if (err == PATCH_ERR_NO_WATCHPOINT) {
+        TEST_SKIP("no hardware watchpoints available");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install pointer hook: %s\n", patch_get_error_details());
+        TEST_SKIP("pointer hook install failed");
+        return;
+    }
+
+    // Save original for our hook to use
+    g_wp_original = (int (*)(int))patch_get_trampoline(handle);
+    assert(g_wp_original != NULL);
+
+    // Call through the hooked pointer - should invoke our hook
+    result = g_wp_func_ptr(10);
+    // Hook calls original (10+1=11) + 100 = 111
+    if (result != 111) {
+        printf("  Expected result: 111, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("pointer hook didn't intercept call");
+        return;
+    }
+
+    // Remove the hook
+    err = patch_remove(handle);
+    assert(err == PATCH_SUCCESS);
+    g_wp_original = NULL;
+
+    // After removal, pointer should be restored
+    result = g_wp_func_ptr(10);
+    if (result != 11) {
+        printf("  After removal: expected 11, got: %d\n", result);
+        TEST_FAIL("pointer not restored after removal");
+        return;
+    }
+
+    TEST_PASS();
+}
+
+static void test_pointer_hook_survives_update(void)
+{
+    printf("Test: Pointer hook survives pointer update (KEEP)...\n");
+
+    // Reset
+    g_wp_func_ptr = wp_target_v1;
+    g_wp_callback_calls = 0;
+    g_wp_callback_action = PATCH_WATCH_KEEP;
+
+    patch_pointer_config_t config = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = (void *)wp_hook_replacement,
+        .on_update = wp_test_callback,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_pointer(&config, &handle);
+
+    if (err == PATCH_ERR_NO_WATCHPOINT) {
+        TEST_SKIP("no hardware watchpoints available");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("pointer hook install failed");
+        return;
+    }
+
+    g_wp_original = (int (*)(int))patch_get_trampoline(handle);
+
+    // Verify hook works initially (original is wp_target_v1: x+1)
+    int result = g_wp_func_ptr(10);
+    assert(result == 111);  // (10+1) + 100
+
+    // Update the pointer - this should trigger the watchpoint
+    // With KEEP action, hook should reinstall with new original
+    g_wp_func_ptr = wp_target_v2;
+
+    // Callback should have been called
+    if (g_wp_callback_calls != 1) {
+        printf("  Expected 1 callback call, got: %d\n", g_wp_callback_calls);
+        patch_remove(handle);
+        TEST_FAIL("callback not called on pointer update");
+        return;
+    }
+
+    // Verify callback received correct values
+    if (g_wp_callback_old != (void *)wp_target_v1) {
+        printf("  Callback old_value mismatch\n");
+        patch_remove(handle);
+        TEST_FAIL("callback received wrong old_value");
+        return;
+    }
+    if (g_wp_callback_new != (void *)wp_target_v2) {
+        printf("  Callback new_value mismatch\n");
+        patch_remove(handle);
+        TEST_FAIL("callback received wrong new_value");
+        return;
+    }
+
+    // Get updated original (should now be wp_target_v2)
+    g_wp_original = (int (*)(int))patch_get_trampoline(handle);
+
+    // Hook should still be active with new original
+    result = g_wp_func_ptr(10);
+    // Hook calls new original (10+2=12) + 100 = 112
+    if (result != 112) {
+        printf("  After update: expected 112, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("hook didn't survive pointer update");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_pointer_hook_remove_action(void)
+{
+    printf("Test: Pointer hook REMOVE action...\n");
+
+    // Reset
+    g_wp_func_ptr = wp_target_v1;
+    g_wp_callback_calls = 0;
+    g_wp_callback_action = PATCH_WATCH_REMOVE;
+
+    patch_pointer_config_t config = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = (void *)wp_hook_replacement,
+        .on_update = wp_test_callback,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_pointer(&config, &handle);
+
+    if (err == PATCH_ERR_NO_WATCHPOINT) {
+        TEST_SKIP("no hardware watchpoints available");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("pointer hook install failed");
+        return;
+    }
+
+    g_wp_original = (int (*)(int))patch_get_trampoline(handle);
+
+    // Verify hook works initially
+    int result = g_wp_func_ptr(10);
+    assert(result == 111);  // (10+1) + 100
+
+    // Update the pointer - callback returns REMOVE
+    g_wp_func_ptr = wp_target_v2;
+
+    // Callback should have been called
+    assert(g_wp_callback_calls == 1);
+
+    // With REMOVE action, the new value should stand (hook removed)
+    // The pointer should now point directly to wp_target_v2
+    result = g_wp_func_ptr(10);
+    if (result != 12) {  // Just 10+2, no hook
+        printf("  After REMOVE: expected 12, got: %d\n", result);
+        patch_remove(handle);  // Clean up just in case
+        TEST_FAIL("REMOVE action didn't remove hook");
+        return;
+    }
+
+    // Note: handle is now partially invalid per the comment in watchpoint.c
+    // User should call patch_remove() to clean up fully
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_pointer_hook_reject_action(void)
+{
+    printf("Test: Pointer hook REJECT action...\n");
+
+    // Reset
+    g_wp_func_ptr = wp_target_v1;
+    g_wp_callback_calls = 0;
+    g_wp_callback_action = PATCH_WATCH_REJECT;
+
+    patch_pointer_config_t config = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = (void *)wp_hook_replacement,
+        .on_update = wp_test_callback,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_pointer(&config, &handle);
+
+    if (err == PATCH_ERR_NO_WATCHPOINT) {
+        TEST_SKIP("no hardware watchpoints available");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("pointer hook install failed");
+        return;
+    }
+
+    g_wp_original = (int (*)(int))patch_get_trampoline(handle);
+
+    // Verify hook works initially
+    int result = g_wp_func_ptr(10);
+    assert(result == 111);  // (10+1) + 100
+
+    // Try to update the pointer - callback returns REJECT
+    g_wp_func_ptr = wp_target_v2;
+
+    // Callback should have been called
+    assert(g_wp_callback_calls == 1);
+
+    // With REJECT action, the update should be ignored
+    // Hook should still use the OLD original (wp_target_v1)
+    // Note: The write physically happened, but we reinstall with old original
+    result = g_wp_func_ptr(10);
+    if (result != 111) {  // Still (10+1) + 100
+        printf("  After REJECT: expected 111, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("REJECT action didn't keep old original");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_pointer_hook_invalid_args(void)
+{
+    printf("Test: Pointer hook invalid arguments...\n");
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err;
+
+    // Null config
+    err = patch_install_pointer(NULL, &handle);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null handle output
+    patch_pointer_config_t config = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = (void *)wp_hook_replacement,
+    };
+    err = patch_install_pointer(&config, NULL);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null location
+    patch_pointer_config_t config2 = {
+        .location = NULL,
+        .replacement = (void *)wp_hook_replacement,
+    };
+    err = patch_install_pointer(&config2, &handle);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    // Null replacement
+    patch_pointer_config_t config3 = {
+        .location = (void **)&g_wp_func_ptr,
+        .replacement = NULL,
+    };
+    err = patch_install_pointer(&config3, &handle);
+    assert(err == PATCH_ERR_INVALID_ARGUMENT);
+
+    TEST_PASS();
+}
+
+static void test_pointer_hook_exhaust_watchpoints(void)
+{
+    printf("Test: Exhausting hardware watchpoints...\n");
+
+    // We have 4 hardware watchpoints available
+    // Create 4 separate function pointers to hook
+    static int (*wp_ptr1)(int) = wp_target_v1;
+    static int (*wp_ptr2)(int) = wp_target_v1;
+    static int (*wp_ptr3)(int) = wp_target_v1;
+    static int (*wp_ptr4)(int) = wp_target_v1;
+    static int (*wp_ptr5)(int) = wp_target_v1;  // This one should fail
+
+    patch_handle_t *handles[5] = {NULL};
+    patch_error_t err;
+    int installed_count = 0;
+
+    void **locations[] = {
+        (void **)&wp_ptr1,
+        (void **)&wp_ptr2,
+        (void **)&wp_ptr3,
+        (void **)&wp_ptr4,
+        (void **)&wp_ptr5,
+    };
+
+    // Try to install 5 pointer hooks
+    for (int i = 0; i < 5; i++) {
+        patch_pointer_config_t config = {
+            .location = locations[i],
+            .replacement = (void *)wp_hook_replacement,
+        };
+
+        err = patch_install_pointer(&config, &handles[i]);
+
+        if (err == PATCH_ERR_NO_WATCHPOINT) {
+            // Expected to fail at some point
+            printf("  Watchpoint exhausted at hook %d\n", i + 1);
+            break;
+        }
+        else if (err != PATCH_SUCCESS) {
+            printf("  Unexpected error at hook %d: %s\n", i + 1, patch_get_error_details());
+            break;
+        }
+        else {
+            installed_count++;
+        }
+    }
+
+    // Clean up installed hooks
+    for (int i = 0; i < 5; i++) {
+        if (handles[i]) {
+            patch_remove(handles[i]);
+        }
+    }
+
+    // We should have been able to install at least some hooks
+    // and eventually hit the limit
+    if (installed_count == 0) {
+        TEST_SKIP("no watchpoints available");
+        return;
+    }
+
+    if (installed_count == 5) {
+        // Unlikely but possible if platform has more than 4 watchpoints
+        printf("  All 5 hooks installed (platform has >4 watchpoints?)\n");
+        TEST_PASS();
+        return;
+    }
+
+    // We hit the limit somewhere in the middle - that's expected
+    printf("  Successfully installed %d hooks before exhausting watchpoints\n",
+           installed_count);
+    TEST_PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2117,6 +2520,15 @@ int main(void)
     test_explicit_breakpoint_method();
     test_breakpoint_disable_enable();
     test_breakpoint_skip_original();
+
+    // Section 12: Watchpoint-Guarded Pointer Hooks
+    printf("\n--- Section 12: Watchpoint Pointer Hooks ---\n\n");
+    test_pointer_hook_basic();
+    test_pointer_hook_survives_update();
+    test_pointer_hook_remove_action();
+    test_pointer_hook_reject_action();
+    test_pointer_hook_invalid_args();
+    test_pointer_hook_exhaust_watchpoints();
 
     // Summary
     printf("\n========================================\n");

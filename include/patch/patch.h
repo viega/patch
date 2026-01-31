@@ -98,6 +98,9 @@ typedef enum {
 
     /** Failed to install signal handler for breakpoint hooking. */
     PATCH_ERR_SIGNAL_HANDLER,
+
+    /** No hardware watchpoints available (all debug registers in use). */
+    PATCH_ERR_NO_WATCHPOINT,
 } patch_error_t;
 
 /**
@@ -748,3 +751,140 @@ patch_error_t patch_set_callbacks(patch_handle_t   *handle,
  *       patch_remove() and patch_install() to change the replacement.
  */
 patch_error_t patch_set_replacement(patch_handle_t *handle, void *replacement);
+
+/* =========================================================================
+ * Watchpoint-Guarded Pointer Hooks - Hook function pointers with auto-repair
+ * ========================================================================= */
+
+/**
+ * @brief Action to take when a watched function pointer is updated.
+ *
+ * When the program writes to a hooked function pointer, the watchpoint
+ * callback returns one of these values to control what happens next.
+ */
+typedef enum {
+    /**
+     * Keep the hook, update the cached original.
+     * The new value is saved as the "original" function, and the detour
+     * is reinstalled. This is the default behavior when no callback is set.
+     */
+    PATCH_WATCH_KEEP,
+
+    /**
+     * Remove the hook, let the new value stand.
+     * The watchpoint is cleared and the program's write takes effect.
+     * The hook handle becomes invalid.
+     */
+    PATCH_WATCH_REMOVE,
+
+    /**
+     * Keep the hook and the old original, ignore the update.
+     * The detour is reinstalled pointing to the same original as before.
+     * The program's attempted write is effectively reverted.
+     */
+    PATCH_WATCH_REJECT,
+} patch_watch_action_t;
+
+/**
+ * @brief Callback invoked when a watched function pointer is updated.
+ *
+ * @param handle    The handle for this pointer hook.
+ * @param old_value The previous "original" function (what we were calling through).
+ * @param new_value What the program tried to write to the pointer.
+ * @param user_data User-provided data from patch_pointer_config_t.user_data.
+ *
+ * @return Action to take (KEEP, REMOVE, or REJECT).
+ *
+ * @note This callback runs in a signal handler context. Avoid calling
+ *       non-async-signal-safe functions (malloc, printf, etc.).
+ */
+typedef patch_watch_action_t (*patch_watch_callback_t)(patch_handle_t *handle,
+                                                       void           *old_value,
+                                                       void           *new_value,
+                                                       void           *user_data);
+
+/**
+ * @brief Configuration for installing a watchpoint-guarded pointer hook.
+ *
+ * This hooks a function pointer (e.g., vtable entry, callback pointer, GOT slot)
+ * and uses a hardware watchpoint to detect when the program updates the pointer.
+ * When an update is detected, the hook is automatically reinstalled (by default)
+ * or an optional callback decides what to do.
+ *
+ * @code
+ * // Hook a vtable entry
+ * patch_pointer_config_t config = {
+ *     .location = &obj->vtable->method,
+ *     .replacement = my_hook,
+ * };
+ * patch_handle_t *handle;
+ * patch_install_pointer(&config, &handle);
+ *
+ * // Now if someone does: obj->vtable->method = other_impl;
+ * // The hook automatically reinstalls with other_impl as the new "original"
+ * @endcode
+ */
+typedef struct {
+    /**
+     * Address of the function pointer to hook.
+     * This is a pointer to a pointer (e.g., &vtable[3], &callback).
+     */
+    void **location;
+
+    /**
+     * Replacement function. Calls to the pointer will invoke this function.
+     * Use patch_get_trampoline() to call the original.
+     */
+    void *replacement;
+
+    /**
+     * Optional callback invoked when the pointer is updated.
+     * If nullptr, defaults to PATCH_WATCH_KEEP behavior.
+     */
+    patch_watch_callback_t on_update;
+
+    /** User data passed to the on_update callback. */
+    void *user_data;
+} patch_pointer_config_t;
+
+/**
+ * @brief Install a watchpoint-guarded hook on a function pointer.
+ *
+ * This installs a hook on a function pointer (vtable entry, callback, etc.)
+ * that is protected by a hardware watchpoint. If the program updates the
+ * pointer, the hook is automatically reinstalled.
+ *
+ * @param config Configuration specifying the pointer location and replacement.
+ * @param handle Output parameter receiving the patch handle.
+ *
+ * @return PATCH_SUCCESS on success,
+ *         PATCH_ERR_NO_WATCHPOINT if all hardware watchpoints are in use,
+ *         PATCH_ERR_INVALID_ARGUMENT if config, location, replacement, or handle is nullptr,
+ *         PATCH_ERR_MEMORY_PROTECTION if the pointer location cannot be written.
+ *
+ * @code
+ * // Example: Hook a C++ vtable entry
+ * MyClass *obj = get_object();
+ * void **vtable = *(void ***)obj;  // First word of object is vtable pointer
+ *
+ * patch_pointer_config_t config = {
+ *     .location = &vtable[3],      // Hook method at index 3
+ *     .replacement = my_hook,
+ *     .on_update = my_callback,    // Optional: called if vtable is swapped
+ * };
+ *
+ * patch_handle_t *handle;
+ * patch_error_t err = patch_install_pointer(&config, &handle);
+ * @endcode
+ *
+ * @note Uses hardware debug registers (DR0-DR3 on x86-64, DBGWVR on ARM64).
+ *       Only 4 watchpoints are available. Returns PATCH_ERR_NO_WATCHPOINT
+ *       when exhausted.
+ *
+ * @note The on_update callback runs in signal handler context. Keep it minimal.
+ *
+ * @see patch_remove() to remove the hook and free the watchpoint.
+ * @see patch_get_trampoline() to call the original function.
+ */
+[[nodiscard]] patch_error_t patch_install_pointer(const patch_pointer_config_t *config,
+                                                  patch_handle_t              **handle);

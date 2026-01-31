@@ -54,6 +54,13 @@ struct patch_handle {
     size_t breakpoint_insn_len;   // Length of original instruction (1 on x86, 4 on ARM64)
     void  *breakpoint_trampoline; // Mini-trampoline: original insn + jump back
 
+    // Watchpoint hooking - if true, this hook uses hardware watchpoint on a pointer
+    bool   is_watchpoint_hook;
+    void **watched_location;      // Address of the function pointer we're watching
+    int    watchpoint_id;         // Hardware watchpoint ID (0-3)
+    patch_watch_callback_t watch_callback;  // Called when pointer is updated
+    void  *watch_user_data;       // User data for watch callback
+
 #ifdef PATCH_HAVE_LIBFFI
     ffi_cif   *ffi_cif;       // Prepared call interface (nullptr if not using FFI)
     ffi_type **ffi_arg_types; // Cached argument types (owned by handle)
