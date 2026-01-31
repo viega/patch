@@ -66,6 +66,7 @@ pop_active_hook(void)
 // This is called from the generated dispatcher stub
 // fp_args points to saved FP registers (8 x 128-bit = 128 bytes)
 // caller_stack points to the caller's stack frame (for accessing stack arguments)
+// trampoline is passed from stub but we use patch__get_chain_next() for chaining support
 uint64_t
 patch__dispatch_full(patch_handle_t  *handle,
                      uint64_t        *args,
@@ -73,18 +74,23 @@ patch__dispatch_full(patch_handle_t  *handle,
                      void            *caller_stack,
                      void            *trampoline)
 {
+    (void)trampoline;  // We use patch__get_chain_next() instead for chaining support
+
+    // Get the next callable in the chain (next hook's dispatcher or actual trampoline)
+    void *next_callable = patch__get_chain_next(handle);
+
     // Re-entrancy check: if this hook is already active on this thread,
-    // bypass callbacks and call the original function directly.
+    // bypass callbacks and call the next in chain directly.
     // This prevents infinite recursion when hook code calls the hooked function.
     if (is_hook_active(handle)) {
 #ifdef PATCH_ARCH_X86_64
         typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-        fn_t fn = (fn_t)trampoline;
+        fn_t fn = (fn_t)next_callable;
         return fn(args[0], args[1], args[2], args[3], args[4], args[5]);
 #else
         typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t, uint64_t);
-        fn_t fn = (fn_t)trampoline;
+        fn_t fn = (fn_t)next_callable;
         return fn(args[0], args[1], args[2], args[3],
                   args[4], args[5], args[6], args[7]);
 #endif
@@ -179,12 +185,12 @@ patch__dispatch_full(patch_handle_t  *handle,
 
             if (ret_is_fp) {
                 // FP return value goes into FP return register
-                ffi_call(handle->ffi_cif, FFI_FN(trampoline), &ctx.fp_return_value, ffi_arg_values);
+                ffi_call(handle->ffi_cif, FFI_FN(next_callable), &ctx.fp_return_value, ffi_arg_values);
                 // Also copy to integer return for compatibility
                 result = ctx.fp_return_value.lo;
             }
             else {
-                ffi_call(handle->ffi_cif, FFI_FN(trampoline), &result, ffi_arg_values);
+                ffi_call(handle->ffi_cif, FFI_FN(next_callable), &result, ffi_arg_values);
             }
             ctx.return_value = result;
         }
@@ -195,12 +201,12 @@ patch__dispatch_full(patch_handle_t  *handle,
             // Note: FP args are restored by the dispatcher stub before returning
 #ifdef PATCH_ARCH_X86_64
             typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-            fn_t fn = (fn_t)trampoline;
+            fn_t fn = (fn_t)next_callable;
             result  = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
 #else
             typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t, uint64_t);
-            fn_t fn = (fn_t)trampoline;
+            fn_t fn = (fn_t)next_callable;
             result  = fn(args[0], args[1], args[2], args[3],
                          args[4], args[5], args[6], args[7]);
 #endif

@@ -63,6 +63,122 @@ ensure_initialized(void)
     futex_once(&g_init_once, do_initialize);
 }
 
+// ============================================================================
+// Hook Chain Registry
+// ============================================================================
+//
+// Tracks all installed hooks by target address. When multiple hooks are
+// installed on the same target, they form a chain. The most recently
+// installed hook runs first.
+//
+// This is a simple linked list since the number of distinct targets is
+// typically small. The mutex must be held when accessing the registry.
+
+typedef struct registry_entry {
+    void                  *target;       // Target function address
+    patch_handle_t        *first_hook;   // First (most recent) hook in chain
+    struct registry_entry *next;         // Next registry entry
+} registry_entry_t;
+
+static registry_entry_t *g_registry = nullptr;
+
+// Find the registry entry for a target (caller must hold mutex)
+static registry_entry_t *
+find_registry_entry(void *target)
+{
+    for (registry_entry_t *e = g_registry; e != nullptr; e = e->next) {
+        if (e->target == target) {
+            return e;
+        }
+    }
+    return nullptr;
+}
+
+patch_handle_t *
+patch__registry_find(void *target)
+{
+    registry_entry_t *entry = find_registry_entry(target);
+    return entry ? entry->first_hook : nullptr;
+}
+
+void
+patch__registry_add(patch_handle_t *handle)
+{
+    registry_entry_t *entry = find_registry_entry(handle->target);
+
+    if (entry == nullptr) {
+        // First hook for this target - create new entry
+        entry = calloc(1, sizeof(*entry));
+        if (entry == nullptr) {
+            return;  // Allocation failure - hook works but not tracked
+        }
+        entry->target     = handle->target;
+        entry->first_hook = handle;
+        entry->next       = g_registry;
+        g_registry        = entry;
+
+        handle->chain_next = nullptr;
+        handle->chain_prev = nullptr;
+    }
+    else {
+        // Add to front of existing chain
+        handle->chain_next = entry->first_hook;
+        handle->chain_prev = nullptr;
+        if (entry->first_hook != nullptr) {
+            entry->first_hook->chain_prev = handle;
+        }
+        entry->first_hook = handle;
+    }
+}
+
+void
+patch__registry_remove(patch_handle_t *handle)
+{
+    registry_entry_t *entry = find_registry_entry(handle->target);
+    if (entry == nullptr) {
+        return;
+    }
+
+    // Update chain links
+    if (handle->chain_prev != nullptr) {
+        handle->chain_prev->chain_next = handle->chain_next;
+    }
+    else {
+        // Removing first hook in chain
+        entry->first_hook = handle->chain_next;
+    }
+
+    if (handle->chain_next != nullptr) {
+        handle->chain_next->chain_prev = handle->chain_prev;
+    }
+
+    // If chain is now empty, remove registry entry
+    if (entry->first_hook == nullptr) {
+        registry_entry_t **pp = &g_registry;
+        while (*pp != nullptr && *pp != entry) {
+            pp = &(*pp)->next;
+        }
+        if (*pp == entry) {
+            *pp = entry->next;
+            free(entry);
+        }
+    }
+
+    handle->chain_next = nullptr;
+    handle->chain_prev = nullptr;
+}
+
+void *
+patch__get_chain_next(patch_handle_t *handle)
+{
+    // If there's another hook in the chain, return its dispatcher
+    if (handle->chain_next != nullptr && handle->chain_next->dispatcher != nullptr) {
+        return handle->chain_next->dispatcher;
+    }
+    // Otherwise return the trampoline (original function)
+    return handle->trampoline->code;
+}
+
 patch_error_t
 patch_can_install(void *target)
 {
@@ -137,15 +253,27 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     // Acquire lock for thread-safe installation
     futex_mutex_lock(&g_patch_mutex);
 
-    // Match prologue pattern
-    pattern_match_t match = pattern_match_prologue(
-        (const uint8_t *)config->target,
-        64);
+    // Check if this target already has hooks installed (for chaining)
+    patch_handle_t *existing = patch__registry_find(config->target);
 
-    if (!match.matched) {
-        patch__set_error("No recognized prologue pattern at target");
-        futex_mutex_unlock(&g_patch_mutex);
-        return PATCH_ERR_PATTERN_UNRECOGNIZED;
+    // Match prologue pattern - only needed for first hook on a target
+    // When chaining, we reuse the match info from the existing hook
+    pattern_match_t match;
+    if (existing != nullptr) {
+        // Chaining: reuse prologue info from existing hook
+        match.matched        = true;
+        match.prologue_size  = existing->patch_size;
+        match.min_patch_size = existing->patch_size;
+        match.has_pc_relative = true;  // Assume yes for safety when chaining
+    }
+    else {
+        // First hook: match the actual prologue
+        match = pattern_match_prologue((const uint8_t *)config->target, 64);
+        if (!match.matched) {
+            patch__set_error("No recognized prologue pattern at target");
+            futex_mutex_unlock(&g_patch_mutex);
+            return PATCH_ERR_PATTERN_UNRECOGNIZED;
+        }
     }
 
     // Create handle
@@ -204,28 +332,50 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     }
 #endif
 
-    // Save original bytes
-    memcpy(h->original_bytes, config->target, match.prologue_size);
+    patch_error_t err;
 
-    // Get original protection
-    patch_error_t err = platform_get_protection(config->target, &h->original_prot);
-    if (err != PATCH_SUCCESS) {
-        free(h);
-        futex_mutex_unlock(&g_patch_mutex);
-        return err;
+    if (existing != nullptr) {
+        // Chaining onto existing hook - copy original bytes from existing chain
+        // (the target is already patched with a detour)
+        memcpy(h->original_bytes, existing->original_bytes, match.prologue_size);
+        h->original_prot = existing->original_prot;
+
+        // Each hook in chain gets its own trampoline for simplicity
+        // (alternative: share trampoline but that complicates ownership)
+        err = patch__trampoline_create(config->target,
+                                       match.prologue_size,
+                                       match.has_pc_relative,
+                                       &h->trampoline);
+        if (err != PATCH_SUCCESS) {
+            free(h);
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
     }
+    else {
+        // First hook on this target - save original bytes
+        memcpy(h->original_bytes, config->target, match.prologue_size);
 
-    // Create trampoline (holds relocated prologue + jump back to original)
-    // For NOP sleds (patchable_function_entry), skip relocation since NOPs have no
-    // PC-relative references. The has_pc_relative flag tells us if we need relocation.
-    err = patch__trampoline_create(config->target,
-                                   match.prologue_size,
-                                   match.has_pc_relative,
-                                   &h->trampoline);
-    if (err != PATCH_SUCCESS) {
-        free(h);
-        futex_mutex_unlock(&g_patch_mutex);
-        return err;
+        // Get original protection
+        err = platform_get_protection(config->target, &h->original_prot);
+        if (err != PATCH_SUCCESS) {
+            free(h);
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+
+        // Create trampoline (holds relocated prologue + jump back to original)
+        // For NOP sleds (patchable_function_entry), skip relocation since NOPs have no
+        // PC-relative references. The has_pc_relative flag tells us if we need relocation.
+        err = patch__trampoline_create(config->target,
+                                       match.prologue_size,
+                                       match.has_pc_relative,
+                                       &h->trampoline);
+        if (err != PATCH_SUCCESS) {
+            free(h);
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
     }
 
     // Determine detour destination based on mode
@@ -249,9 +399,13 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     }
     h->detour_dest = detour_dest;
 
-    // Write the detour at the original function
+    // Add to registry (sets up chain links)
+    patch__registry_add(h);
+
+    // Write the detour at the original function (always update, even when chaining)
     err = patch__write_detour(config->target, detour_dest, match.prologue_size);
     if (err != PATCH_SUCCESS) {
+        patch__registry_remove(h);
         if (h->dispatcher != nullptr) {
             patch__dispatcher_destroy(h->dispatcher);
         }
@@ -276,14 +430,39 @@ patch_remove(patch_handle_t *handle)
 
     futex_mutex_lock(&g_patch_mutex);
 
-    // Restore original bytes
-    patch_error_t err = patch__restore_bytes(handle->target,
-                                             handle->original_bytes,
-                                             handle->patch_size);
-    if (err != PATCH_SUCCESS) {
-        futex_mutex_unlock(&g_patch_mutex);
-        return err;
+    // Check if this is the first hook in the chain (the one the detour points to)
+    patch_handle_t *first_in_chain = patch__registry_find(handle->target);
+    bool            is_first       = (first_in_chain == handle);
+
+    // Remove from registry (updates chain links)
+    patch__registry_remove(handle);
+
+    // Update detour or restore original bytes
+    patch_error_t err = PATCH_SUCCESS;
+    if (is_first) {
+        // We were the first hook - need to update the detour
+        patch_handle_t *new_first = patch__registry_find(handle->target);
+        if (new_first != nullptr) {
+            // Chain continues - point detour to next hook's dispatcher
+            err = patch__write_detour(handle->target,
+                                      new_first->detour_dest,
+                                      handle->patch_size);
+        }
+        else {
+            // Chain empty - restore original bytes
+            err = patch__restore_bytes(handle->target,
+                                       handle->original_bytes,
+                                       handle->patch_size);
+        }
+
+        if (err != PATCH_SUCCESS) {
+            // Re-add to registry on failure (try to maintain consistency)
+            patch__registry_add(handle);
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
     }
+    // If not first, we just removed from chain - detour still valid
 
     // Free dispatcher (may be nullptr in simple replacement mode)
     if (handle->dispatcher != nullptr) {
@@ -455,7 +634,8 @@ patch_context_get_original(patch_context_t *ctx)
     if (ctx == nullptr || ctx->handle == nullptr) {
         return nullptr;
     }
-    return ctx->handle->trampoline->code;
+    // When chaining, "original" is the next hook in chain, or the trampoline
+    return patch__get_chain_next(ctx->handle);
 }
 
 void *

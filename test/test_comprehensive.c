@@ -649,6 +649,143 @@ static void test_reentrancy_guard(void)
     patch_remove(handle);
     TEST_PASS();
 }
+
+// Hook chaining test - trackers for callback order
+static int g_chain_call_order[4] = {0};
+static int g_chain_call_count = 0;
+
+static bool chain_prologue_A(patch_context_t *ctx, void *ud)
+{
+    (void)ud;
+    g_chain_call_order[g_chain_call_count++] = 1;  // A = 1
+
+    // Modify the argument: add 100
+    int *arg = (int *)patch_context_get_arg(ctx, 0);
+    int new_val = *arg + 100;
+    patch_context_set_arg(ctx, 0, &new_val, sizeof(new_val));
+
+    return true;  // Call next (either hook B or original)
+}
+
+static bool chain_prologue_B(patch_context_t *ctx, void *ud)
+{
+    (void)ud;
+    g_chain_call_order[g_chain_call_count++] = 2;  // B = 2
+
+    // Modify the argument: multiply by 2
+    int *arg = (int *)patch_context_get_arg(ctx, 0);
+    int new_val = *arg * 2;
+    patch_context_set_arg(ctx, 0, &new_val, sizeof(new_val));
+
+    return true;  // Call next (hook A)
+}
+
+static void test_hook_chaining(void)
+{
+    printf("Test: Hook chaining (multiple hooks on same target)...\n");
+
+    // Reset trackers
+    g_chain_call_count = 0;
+    memset(g_chain_call_order, 0, sizeof(g_chain_call_order));
+
+    // Verify original function works: func_identity(5) = 5
+    int result = PATCH_CALL(func_identity, 5);
+    assert(result == 5);
+
+    // Install hook A (first)
+    patch_handle_t *handle_a = NULL;
+    patch_config_t config_a = {
+        .target = (void *)func_identity,
+        .prologue = chain_prologue_A,
+    };
+
+    patch_error_t err = patch_install(&config_a, &handle_a);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook A: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot install hook A");
+        return;
+    }
+
+    // Test with only hook A: identity(5) -> A adds 100 -> identity(105) = 105
+    g_chain_call_count = 0;
+    result = PATCH_CALL(func_identity, 5);
+    if (result != 105) {
+        printf("  With hook A only: expected 105, got %d\n", result);
+        patch_remove(handle_a);
+        TEST_FAIL("hook A didn't modify argument correctly");
+        return;
+    }
+    if (g_chain_call_count != 1 || g_chain_call_order[0] != 1) {
+        printf("  Hook A wasn't called\n");
+        patch_remove(handle_a);
+        TEST_FAIL("hook A call tracking failed");
+        return;
+    }
+
+    // Install hook B (second) - should chain with A
+    patch_handle_t *handle_b = NULL;
+    patch_config_t config_b = {
+        .target = (void *)func_identity,
+        .prologue = chain_prologue_B,
+    };
+
+    err = patch_install(&config_b, &handle_b);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook B: %s\n", patch_get_error_details());
+        patch_remove(handle_a);
+        TEST_SKIP("cannot install hook B");
+        return;
+    }
+
+    // Test with both hooks: B runs first (most recent), then A
+    // identity(5) -> B multiplies by 2 -> 10 -> A adds 100 -> 110 -> identity(110) = 110
+    g_chain_call_count = 0;
+    result = PATCH_CALL(func_identity, 5);
+    if (result != 110) {
+        printf("  With both hooks: expected 110, got %d\n", result);
+        patch_remove(handle_b);
+        patch_remove(handle_a);
+        TEST_FAIL("chained hooks didn't process correctly");
+        return;
+    }
+    if (g_chain_call_count != 2) {
+        printf("  Expected 2 hook calls, got %d\n", g_chain_call_count);
+        patch_remove(handle_b);
+        patch_remove(handle_a);
+        TEST_FAIL("not all hooks were called");
+        return;
+    }
+    if (g_chain_call_order[0] != 2 || g_chain_call_order[1] != 1) {
+        printf("  Wrong call order: expected B(2) then A(1), got %d then %d\n",
+               g_chain_call_order[0], g_chain_call_order[1]);
+        patch_remove(handle_b);
+        patch_remove(handle_a);
+        TEST_FAIL("hooks called in wrong order");
+        return;
+    }
+
+    // Remove hook B, verify A still works
+    patch_remove(handle_b);
+    g_chain_call_count = 0;
+    result = PATCH_CALL(func_identity, 5);
+    if (result != 105) {
+        printf("  After removing B: expected 105, got %d\n", result);
+        patch_remove(handle_a);
+        TEST_FAIL("hook A didn't work after removing B");
+        return;
+    }
+
+    // Remove hook A, verify function is restored
+    patch_remove(handle_a);
+    result = PATCH_CALL(func_identity, 5);
+    if (result != 5) {
+        printf("  After removing all hooks: expected 5, got %d\n", result);
+        TEST_FAIL("function not restored after removing all hooks");
+        return;
+    }
+
+    TEST_PASS();
+}
 #endif
 
 static void test_idempotent_operations(void)
@@ -1137,8 +1274,11 @@ int main(void)
     test_idempotent_operations();
 #ifndef PATCH_PLATFORM_DARWIN
     test_reentrancy_guard();
+    test_hook_chaining();
 #else
     printf("Test: Re-entrancy guard prevents infinite recursion...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+    printf("Test: Hook chaining (multiple hooks on same target)...\n");
     TEST_SKIP("Low-level API not available on macOS");
 #endif
 

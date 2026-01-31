@@ -39,6 +39,10 @@ struct patch_handle {
     atomic_bool          enabled;
     mem_prot_t           original_prot;
 
+    // Hook chaining - multiple hooks on the same target
+    struct patch_handle *chain_next;   // Next hook in chain (installed earlier)
+    struct patch_handle *chain_prev;   // Previous hook in chain (installed later)
+
 #ifdef PATCH_HAVE_LIBFFI
     ffi_cif   *ffi_cif;       // Prepared call interface (nullptr if not using FFI)
     ffi_type **ffi_arg_types; // Cached argument types (owned by handle)
@@ -90,3 +94,16 @@ patch_error_t patch__write_detour(void *target, void *destination, size_t availa
 
 // Restore original bytes at target
 patch_error_t patch__restore_bytes(void *target, const uint8_t *original, size_t size);
+
+// Hook chain registry - tracks hooks by target address
+// Returns the first (most recently installed) hook for a target, or NULL
+patch_handle_t *patch__registry_find(void *target);
+
+// Add a hook to the registry (at the front of the chain for its target)
+void patch__registry_add(patch_handle_t *handle);
+
+// Remove a hook from the registry
+void patch__registry_remove(patch_handle_t *handle);
+
+// Get the "next" callable for a hook - either next hook's dispatcher or trampoline
+void *patch__get_chain_next(patch_handle_t *handle);
