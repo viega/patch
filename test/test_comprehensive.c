@@ -558,6 +558,99 @@ static void test_hook_is_installed_macro(void)
     TEST_PASS();
 }
 
+// Re-entrancy guard test components
+#ifndef PATCH_PLATFORM_DARWIN
+
+// Test function for re-entrancy
+PATCH_DEFINE_HOOKABLE(int, func_reentrant, int depth)
+{
+    return depth;
+}
+
+// Re-entrancy test counter
+static int g_reentrant_hook_calls = 0;
+
+// Hook that calls the hooked function recursively
+// Without re-entrancy guard, this would cause infinite recursion
+static bool reentrant_prologue(patch_context_t *ctx, void *ud)
+{
+    (void)ud;
+    g_reentrant_hook_calls++;
+
+    int *depth_arg = (int *)patch_context_get_arg(ctx, 0);
+    int depth = *depth_arg;
+
+    if (depth > 0) {
+        // Call the hooked function recursively
+        // The re-entrancy guard should detect this is re-entrant and
+        // bypass the prologue callback, calling the original directly
+        int recursive_result = PATCH_CALL(func_reentrant, depth - 1);
+
+        // Modify return value to include recursive result
+        int result = depth * 10 + recursive_result;
+        patch_context_set_return(ctx, &result, sizeof(result));
+        return false;  // Don't call original, use our computed result
+    }
+
+    return true;  // Base case: call original
+}
+
+static void test_reentrancy_guard(void)
+{
+    printf("Test: Re-entrancy guard prevents infinite recursion...\n");
+
+    // Reset counter
+    g_reentrant_hook_calls = 0;
+
+    // First verify the function works without hooks
+    int result = PATCH_CALL(func_reentrant, 3);
+    assert(result == 3);
+
+    // Install hook that calls the hooked function recursively
+    patch_handle_t *handle = NULL;
+    patch_config_t config = {
+        .target = (void *)func_reentrant,
+        .prologue = reentrant_prologue,
+    };
+
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook func_reentrant");
+        return;
+    }
+
+    // Call with depth=3
+    // Without re-entrancy guard: infinite recursion
+    // With re-entrancy guard:
+    //   - First call: hook runs, depth=3, calls func_reentrant(2)
+    //   - Second call: re-entrancy detected, bypasses hook, returns 2 directly
+    //   - So first call computes: 3*10 + 2 = 32
+    result = PATCH_CALL(func_reentrant, 3);
+
+    // Hook should only be called ONCE (the initial call)
+    // The recursive call should bypass the hook
+    if (g_reentrant_hook_calls != 1) {
+        printf("  Expected 1 hook call, got %d\n", g_reentrant_hook_calls);
+        patch_remove(handle);
+        TEST_FAIL("re-entrancy guard did not prevent recursive hook calls");
+        return;
+    }
+
+    // Result should be 3*10 + 2 = 32
+    // (depth=3 multiplied by 10, plus direct return of depth-1=2)
+    if (result != 32) {
+        printf("  Expected result: 32, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("re-entrancy guard returned wrong result");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+#endif
+
 static void test_idempotent_operations(void)
 {
     printf("Test: Idempotent disable/enable...\n");
@@ -1042,6 +1135,12 @@ int main(void)
     test_identity_function_hook();
     test_hook_is_installed_macro();
     test_idempotent_operations();
+#ifndef PATCH_PLATFORM_DARWIN
+    test_reentrancy_guard();
+#else
+    printf("Test: Re-entrancy guard prevents infinite recursion...\n");
+    TEST_SKIP("Low-level API not available on macOS");
+#endif
 
     // Section 5: Data Types
     printf("\n--- Section 5: Data Types ---\n\n");

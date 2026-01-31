@@ -4,6 +4,56 @@
 
 #include <string.h>
 
+// ============================================================================
+// Re-entrancy Guard
+// ============================================================================
+//
+// Prevents infinite recursion when hook code calls the hooked function.
+// Uses a thread-local linked list of currently-active hook handles.
+// List nodes are stack-allocated, so no heap allocation needed.
+
+typedef struct active_hook_frame {
+    patch_handle_t             *handle;
+    struct active_hook_frame   *next;
+} active_hook_frame_t;
+
+// Thread-local head of active hooks list
+static _Thread_local active_hook_frame_t *g_active_hooks = nullptr;
+
+// Check if a handle is currently active (being executed) on this thread
+static inline bool
+is_hook_active(patch_handle_t *handle)
+{
+    for (active_hook_frame_t *f = g_active_hooks; f != nullptr; f = f->next) {
+        if (f->handle == handle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Push a handle onto the active list (call before invoking callbacks)
+static inline void
+push_active_hook(active_hook_frame_t *frame, patch_handle_t *handle)
+{
+    frame->handle = handle;
+    frame->next   = g_active_hooks;
+    g_active_hooks = frame;
+}
+
+// Pop a handle from the active list (call after callbacks complete)
+static inline void
+pop_active_hook(void)
+{
+    if (g_active_hooks != nullptr) {
+        g_active_hooks = g_active_hooks->next;
+    }
+}
+
+// ============================================================================
+// Dispatcher
+// ============================================================================
+//
 // The dispatcher is dynamically generated code that:
 // 1. Saves argument registers
 // 2. Calls the dispatch helper which handles prologue, original call, and epilogue
@@ -23,6 +73,27 @@ patch__dispatch_full(patch_handle_t  *handle,
                      void            *caller_stack,
                      void            *trampoline)
 {
+    // Re-entrancy check: if this hook is already active on this thread,
+    // bypass callbacks and call the original function directly.
+    // This prevents infinite recursion when hook code calls the hooked function.
+    if (is_hook_active(handle)) {
+#ifdef PATCH_ARCH_X86_64
+        typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+        fn_t fn = (fn_t)trampoline;
+        return fn(args[0], args[1], args[2], args[3], args[4], args[5]);
+#else
+        typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                 uint64_t, uint64_t, uint64_t, uint64_t);
+        fn_t fn = (fn_t)trampoline;
+        return fn(args[0], args[1], args[2], args[3],
+                  args[4], args[5], args[6], args[7]);
+#endif
+    }
+
+    // Mark this hook as active for re-entrancy detection
+    active_hook_frame_t frame;
+    push_active_hook(&frame, handle);
+
     patch_context_t ctx = {0};
     ctx.handle          = handle;
     ctx.caller_stack    = caller_stack;
@@ -145,6 +216,9 @@ patch__dispatch_full(patch_handle_t  *handle,
         handle->epilogue(&ctx, handle->epilogue_user_data);
         result = ctx.return_value;
     }
+
+    // Remove this hook from active list
+    pop_active_hook();
 
     return result;
 }
