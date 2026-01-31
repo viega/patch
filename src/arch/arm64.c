@@ -409,6 +409,11 @@ is_stp_callee_saved(uint32_t insn)
     return (rt >= 19 && rt <= 28);
 }
 
+// Forward declarations for patterns that reference each other
+static bool match_frame_setup(const uint8_t *code, size_t avail, pattern_match_t *out);
+static bool match_frame_setup_alt(const uint8_t *code, size_t avail, pattern_match_t *out);
+static bool match_frame_setup_preindex_callee(const uint8_t *code, size_t avail, pattern_match_t *out);
+
 // Pattern: Standard frame setup
 // stp x29, x30, [sp, #-N]!
 // mov x29, sp
@@ -470,9 +475,11 @@ match_pac(const uint8_t *code, size_t avail, pattern_match_t *out)
         return false;
     }
 
-    // Try to match rest as frame_setup
+    // Try to match rest as frame_setup variants
     pattern_match_t sub = {0};
-    if (match_frame_setup(code + 4, avail - 4, &sub)) {
+    if (match_frame_setup(code + 4, avail - 4, &sub) ||
+        match_frame_setup_alt(code + 4, avail - 4, &sub) ||
+        match_frame_setup_preindex_callee(code + 4, avail - 4, &sub)) {
         out->matched         = true;
         out->pattern_name    = "arm64_pac_frame";
         out->prologue_size   = 4 + sub.prologue_size;
@@ -500,9 +507,11 @@ match_bti(const uint8_t *code, size_t avail, pattern_match_t *out)
         return false;
     }
 
-    // Try to match rest as frame_setup or PAC
+    // Try to match rest as PAC, frame_setup, or frame_setup_alt
     pattern_match_t sub = {0};
-    if (match_pac(code + 4, avail - 4, &sub) || match_frame_setup(code + 4, avail - 4, &sub)) {
+    if (match_pac(code + 4, avail - 4, &sub) ||
+        match_frame_setup(code + 4, avail - 4, &sub) ||
+        match_frame_setup_alt(code + 4, avail - 4, &sub)) {
         out->matched         = true;
         out->pattern_name    = "arm64_bti_prologue";
         out->prologue_size   = 4 + sub.prologue_size;
@@ -549,6 +558,251 @@ match_leaf(const uint8_t *code, size_t avail, pattern_match_t *out)
     out->has_pc_relative = false;
 
     return true;
+}
+
+// Check if instruction is STP with signed offset (not pre-index)
+// Used for: stp x29, x30, [sp, #offset]
+static inline bool
+is_stp_signed_offset(uint32_t insn)
+{
+    // STP Xt1, Xt2, [Xn, #imm] (signed offset, no writeback)
+    // 1x10 1001 00ii iiii itttt tnnn nntt ttt1
+    return (insn & 0xFFC00000) == 0xA9000000;
+}
+
+// Check if instruction is ADD Xd, sp, #imm
+static inline bool
+is_add_from_sp(uint32_t insn, uint32_t *rd)
+{
+    // ADD Xd, Xn, #imm (64-bit)
+    // 1001 0001 00ii iiii iiii iinn nnnd dddd
+    // We want Xn = sp (11111)
+    if ((insn & 0xFF000000) != 0x91000000) {
+        return false;
+    }
+    uint32_t rn = (insn >> 5) & 0x1F;
+    if (rn != 31) {
+        return false;
+    }
+    *rd = insn & 0x1F;
+    return true;
+}
+
+// Check if instruction is STP for callee-saved registers (with signed offset variant)
+static inline bool
+is_stp_callee_saved_signed(uint32_t insn)
+{
+    // STP with signed offset (not pre-index): 1x10 1001 00ii iiii itttt tnnn nntt ttt1
+    if ((insn & 0xFFC00000) != 0xA9000000) {
+        return false;
+    }
+    uint32_t rt = insn & 0x1F;
+    // x19-x28 are callee-saved
+    return (rt >= 19 && rt <= 28);
+}
+
+// Check if instruction is STP callee-saved with pre-index (allocates stack AND saves)
+static inline bool
+is_stp_callee_saved_pre(uint32_t insn)
+{
+    // STP with pre-index: 1x10 1001 11ii iiii itttt tnnn nntt ttt1
+    if ((insn & 0xFFC00000) != 0xA9800000) {
+        return false;
+    }
+    uint32_t rt = insn & 0x1F;
+    uint32_t rn = (insn >> 5) & 0x1F;
+    // x19-x28 are callee-saved, base must be sp
+    return (rt >= 19 && rt <= 28) && (rn == 31);
+}
+
+// Pattern: Alternative frame setup with explicit SUB then STP at offset
+// Source: Observed in glibc printf, macOS libSystem printf/sprintf/puts/fopen/etc.
+// Pattern variants:
+//   1. sub sp, sp, #N; stp x29, x30, [sp, #off]; add x29, sp, #off
+//   2. sub sp, sp, #N; stp xA, xB, [sp, #off1]; ... ; stp x29, x30, [sp, #off2]; add x29, sp, #off2
+// The second variant saves callee-saved registers BEFORE x29,x30.
+// See PATTERNS.md for full documentation.
+static bool
+match_frame_setup_alt(const uint8_t *code, size_t avail, pattern_match_t *out)
+{
+    if (avail < 12) {  // Need at least 3 instructions
+        return false;
+    }
+
+    uint32_t insn0 = read_insn(code);
+
+    // First instruction: SUB sp, sp, #imm
+    if (!is_sub_sp(insn0)) {
+        return false;
+    }
+
+    size_t offset = 4;
+
+    // Skip any callee-saved register saves that come before x29,x30
+    while (avail >= offset + 4) {
+        uint32_t insn = read_insn(code + offset);
+        if (is_stp_callee_saved_signed(insn)) {
+            offset += 4;
+        }
+        else {
+            break;
+        }
+    }
+
+    // Now we need: STP x29, x30, [sp, #offset] (signed offset, not pre-index)
+    if (avail < offset + 8) {
+        return false;
+    }
+
+    uint32_t stp_insn = read_insn(code + offset);
+    if (!is_stp_signed_offset(stp_insn) || !is_stp_fp_lr(stp_insn)) {
+        return false;
+    }
+    offset += 4;
+
+    // Next instruction: ADD x29, sp, #offset (set up frame pointer)
+    uint32_t add_insn = read_insn(code + offset);
+    uint32_t rd;
+    if (!is_add_from_sp(add_insn, &rd) || rd != 29) {
+        return false;
+    }
+    offset += 4;
+
+    // Look for additional callee-saved register saves or stack adjustments
+    while (avail >= offset + 4) {
+        uint32_t insn = read_insn(code + offset);
+        if (is_stp_callee_saved(insn) || is_stp_callee_saved_signed(insn) || is_sub_sp(insn)) {
+            offset += 4;
+        }
+        else {
+            break;
+        }
+    }
+
+    out->matched         = true;
+    out->pattern_name    = "arm64_frame_setup_alt";
+    out->prologue_size   = offset;
+    out->min_patch_size  = 4;
+    out->has_pc_relative = false;
+
+    return true;
+}
+
+// Pattern: Frame setup starting with pre-indexed callee-saved STP
+// Source: Observed in macOS libSystem fclose, fread, etc.
+// Pattern: stp xA, xB, [sp, #-N]!; stp ...; stp x29, x30, [sp, #off]; add x29, sp, #off
+// The stack allocation is implicit in the first pre-indexed STP.
+// See PATTERNS.md for full documentation.
+static bool
+match_frame_setup_preindex_callee(const uint8_t *code, size_t avail, pattern_match_t *out)
+{
+    if (avail < 16) {  // Need at least 4 instructions
+        return false;
+    }
+
+    uint32_t insn0 = read_insn(code);
+
+    // First instruction: STP callee-saved, [sp, #-N]! (pre-indexed)
+    if (!is_stp_callee_saved_pre(insn0)) {
+        return false;
+    }
+
+    size_t offset = 4;
+
+    // Skip any additional callee-saved register saves (signed offset)
+    while (avail >= offset + 4) {
+        uint32_t insn = read_insn(code + offset);
+        if (is_stp_callee_saved_signed(insn)) {
+            offset += 4;
+        }
+        else {
+            break;
+        }
+    }
+
+    // Now we need: STP x29, x30, [sp, #offset] (signed offset)
+    if (avail < offset + 8) {
+        return false;
+    }
+
+    uint32_t stp_insn = read_insn(code + offset);
+    if (!is_stp_signed_offset(stp_insn) || !is_stp_fp_lr(stp_insn)) {
+        return false;
+    }
+    offset += 4;
+
+    // Next instruction: ADD x29, sp, #offset (set up frame pointer)
+    uint32_t add_insn = read_insn(code + offset);
+    uint32_t rd;
+    if (!is_add_from_sp(add_insn, &rd) || rd != 29) {
+        return false;
+    }
+    offset += 4;
+
+    // Look for additional callee-saved register saves or stack adjustments
+    while (avail >= offset + 4) {
+        uint32_t insn = read_insn(code + offset);
+        if (is_stp_callee_saved(insn) || is_stp_callee_saved_signed(insn) || is_sub_sp(insn)) {
+            offset += 4;
+        }
+        else {
+            break;
+        }
+    }
+
+    out->matched         = true;
+    out->pattern_name    = "arm64_frame_setup_preindex_callee";
+    out->prologue_size   = offset;
+    out->min_patch_size  = 4;
+    out->has_pc_relative = false;
+
+    return true;
+}
+
+// Check if instruction is CBZ or CBNZ
+static inline bool
+is_cbz_cbnz(uint32_t insn)
+{
+    // CBZ:  x011 0100 imm19 Rt
+    // CBNZ: x011 0101 imm19 Rt
+    return (insn & 0x7E000000) == 0x34000000;
+}
+
+// Pattern: Null/condition check followed by standard prologue
+// Source: Observed in glibc free(), realloc() - check for null before frame setup
+// Pattern: cbz/cbnz xN, label; <standard_prologue>
+// See PATTERNS.md for full documentation.
+static bool
+match_null_check_prologue(const uint8_t *code, size_t avail, pattern_match_t *out)
+{
+    if (avail < 8) {
+        return false;
+    }
+
+    uint32_t insn0 = read_insn(code);
+
+    // First instruction must be CBZ or CBNZ
+    if (!is_cbz_cbnz(insn0)) {
+        return false;
+    }
+
+    // Try to match the rest as a standard prologue
+    pattern_match_t sub = {0};
+    if (match_pac(code + 4, avail - 4, &sub) ||
+        match_frame_setup(code + 4, avail - 4, &sub) ||
+        match_frame_setup_alt(code + 4, avail - 4, &sub)) {
+
+        out->matched         = true;
+        out->pattern_name    = "arm64_null_check_prologue";
+        out->prologue_size   = 4 + sub.prologue_size;
+        out->min_patch_size  = 4;
+        // The CBZ/CBNZ is PC-relative, so we need relocation
+        out->has_pc_relative = true;
+
+        return true;
+    }
+
+    return false;
 }
 
 // Pattern: Patchable function entry (NOP sled from __attribute__((patchable_function_entry)))
@@ -628,6 +882,20 @@ static pattern_handler_t handler_patchable = {
     .match       = match_patchable_entry,
 };
 
+static pattern_handler_t handler_frame_setup_alt = {
+    .name        = "arm64_frame_setup_alt",
+    .description = "Alternative frame setup: sub sp; stp x29,x30,[sp,#off]; add x29,sp,#off",
+    .priority    = 95,
+    .match       = match_frame_setup_alt,
+};
+
+static pattern_handler_t handler_null_check = {
+    .name        = "arm64_null_check_prologue",
+    .description = "Null check prologue: cbz/cbnz followed by standard prologue",
+    .priority    = 90,
+    .match       = match_null_check_prologue,
+};
+
 void
 pattern_init_arm64(void)
 {
@@ -638,9 +906,11 @@ pattern_init_arm64(void)
     initialized = true;
 
     pattern_register(&handler_patchable);
-    pattern_register(&handler_frame_setup);
-    pattern_register(&handler_pac);
     pattern_register(&handler_bti);
+    pattern_register(&handler_pac);
+    pattern_register(&handler_frame_setup);
+    pattern_register(&handler_frame_setup_alt);
+    pattern_register(&handler_null_check);
     pattern_register(&handler_leaf);
 }
 
