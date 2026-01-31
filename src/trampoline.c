@@ -7,7 +7,10 @@
 #include <string.h>
 
 patch_error_t
-patch__trampoline_create(void *target, size_t prologue_size, patch__trampoline_t **out)
+patch__trampoline_create(void            *target,
+                         size_t           prologue_size,
+                         bool             needs_relocation,
+                         patch__trampoline_t **out)
 {
     patch__trampoline_t *tramp = calloc(1, sizeof(*tramp));
     if (tramp == nullptr) {
@@ -27,13 +30,24 @@ patch__trampoline_create(void *target, size_t prologue_size, patch__trampoline_t
     tramp->code       = exec_mem;
     tramp->alloc_size = PATCH_TRAMPOLINE_SIZE;
 
-    // Copy and relocate the prologue bytes
-    size_t relocated = arch_relocate((const uint8_t *)target,
-                                     prologue_size,
-                                     tramp->code,
-                                     PATCH_TRAMPOLINE_SIZE - 16,
-                                     (uintptr_t)target,
-                                     (uintptr_t)tramp->code);
+    // Copy prologue bytes to trampoline.
+    // For NOP sleds (needs_relocation=false), we can just memcpy since NOPs have
+    // no PC-relative references. For real prologues, use arch_relocate to fix up
+    // any PC-relative instructions.
+    size_t relocated;
+    if (needs_relocation) {
+        relocated = arch_relocate((const uint8_t *)target,
+                                  prologue_size,
+                                  tramp->code,
+                                  PATCH_TRAMPOLINE_SIZE - 16,
+                                  (uintptr_t)target,
+                                  (uintptr_t)tramp->code);
+    }
+    else {
+        // NOP sled - just copy directly, no relocation needed
+        memcpy(tramp->code, target, prologue_size);
+        relocated = prologue_size;
+    }
 
     if (relocated == 0) {
         platform_free_exec(tramp->code, tramp->alloc_size);

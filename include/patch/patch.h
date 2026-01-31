@@ -140,8 +140,22 @@ typedef void (*patch_epilogue_fn)(patch_context_t *ctx, void *user_data);
 /**
  * @brief Configuration for installing a patch.
  *
- * Specifies the target function and optional callbacks. At least one of
- * prologue or epilogue should be non-null for the patch to be useful.
+ * There are two modes of operation:
+ *
+ * **Simple mode** (set `replacement`): Direct function replacement.
+ * Calls to target are redirected to replacement. Faster than callback mode
+ * since no dispatcher stub is generated.
+ *
+ * @code
+ * patch_config_t config = {
+ *     .target = (void *)original_func,
+ *     .replacement = (void *)my_replacement,
+ * };
+ * @endcode
+ *
+ * **Callback mode** (set `prologue` and/or `epilogue`): Advanced hooking
+ * with argument inspection. Calls to target go through a dispatcher that
+ * invokes callbacks before/after the original function.
  *
  * @code
  * patch_config_t config = {
@@ -150,10 +164,24 @@ typedef void (*patch_epilogue_fn)(patch_context_t *ctx, void *user_data);
  *     .prologue_user_data = &my_context,
  * };
  * @endcode
+ *
+ * You cannot mix both modes (i.e., don't set replacement and callbacks).
  */
 typedef struct {
     /** Target function to patch. Must point to the start of the function. */
     void *target;
+
+    /**
+     * Simple replacement mode: direct replacement function.
+     * When set, calls to target are redirected directly to this function
+     * without going through the dispatcher. The replacement receives the
+     * same arguments as target and must have the same signature.
+     *
+     * Use patch_get_trampoline() on the handle to call the original.
+     *
+     * Mutually exclusive with prologue/epilogue callbacks.
+     */
+    void *replacement;
 
     /** Callback invoked before the original function (may be nullptr). */
     patch_prologue_fn prologue;
@@ -374,3 +402,33 @@ void patch_context_set_return(patch_context_t *ctx,
  * @endcode
  */
 [[nodiscard]] void *patch_context_get_original(patch_context_t *ctx);
+
+/**
+ * @brief Get the trampoline (original function) from a patch handle.
+ *
+ * Returns a pointer to the trampoline that executes the original
+ * function. This is primarily for use with simple replacement mode,
+ * where there is no context object.
+ *
+ * @param handle Handle returned by patch_install().
+ *
+ * @return Function pointer that can be cast to the original signature,
+ *         or nullptr if handle is invalid.
+ *
+ * @code
+ * static patch_handle_t *g_handle;
+ *
+ * int my_replacement(int a, int b) {
+ *     typedef int (*orig_fn)(int, int);
+ *     orig_fn original = (orig_fn)patch_get_trampoline(g_handle);
+ *     return original(a, b) + 100;
+ * }
+ *
+ * patch_config_t config = {
+ *     .target = (void *)add,
+ *     .replacement = (void *)my_replacement,
+ * };
+ * patch_install(&config, &g_handle);
+ * @endcode
+ */
+[[nodiscard]] void *patch_get_trampoline(patch_handle_t *handle);

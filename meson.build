@@ -10,13 +10,12 @@ project('patch', 'c',
 cc = meson.get_compiler('c')
 
 # Detect architecture
+# Pattern recognition is merged into the arch files
 arch = host_machine.cpu_family()
 if arch == 'x86_64'
     arch_sources = ['src/arch/x86_64.c']
-    pattern_sources = ['src/pattern/x86_64_common.c']
 elif arch == 'aarch64'
     arch_sources = ['src/arch/arm64.c']
-    pattern_sources = ['src/pattern/arm64_common.c']
 else
     error('Unsupported architecture: ' + arch)
 endif
@@ -40,7 +39,7 @@ lib_sources = [
     'src/trampoline.c',
     'src/dispatcher.c',
     'src/pattern/registry.c',
-] + arch_sources + pattern_sources + platform_sources
+] + arch_sources + platform_sources
 
 # Build the library
 patch_lib = static_library('patch',

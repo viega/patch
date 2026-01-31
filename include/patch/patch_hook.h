@@ -478,15 +478,27 @@ patch__hook_install(void           **ptr_loc,
         *saved_ptr = *ptr_loc;
         *ptr_loc   = hook;
     }
-    else {
-        // CODE method: Currently falls back to POINTER.
-        // TODO: Implement trampoline-based code patching for direct replacement.
-        *saved_ptr   = *ptr_loc;
-        *ptr_loc     = hook;
-        *method_used = PATCH_METHOD_POINTER;
+    else if (method == PATCH_METHOD_CODE) {
+        // Use the low-level API with simple replacement mode.
+        // This patches the actual function code with a jump to the hook.
+        patch_config_t config = {
+            .target      = original,
+            .replacement = hook,
+        };
 
-        (void)original;
-        (void)handle;
+        patch_error_t err = patch_install(&config, handle);
+        if (err == PATCH_SUCCESS) {
+            // Also update pointer for PATCH_CALL to work
+            *saved_ptr = *ptr_loc;
+            *ptr_loc   = hook;
+        }
+        else {
+            // Code patching failed - fall back to pointer method
+            *saved_ptr   = *ptr_loc;
+            *ptr_loc     = hook;
+            *handle      = nullptr;
+            *method_used = PATCH_METHOD_POINTER;
+        }
     }
 }
 
@@ -508,6 +520,7 @@ patch__hook_remove(void           **ptr_loc,
             patch_remove(*handle);
             *handle = nullptr;
         }
+        // Also restore pointer
         if (*saved_ptr) {
             *ptr_loc   = *saved_ptr;
             *saved_ptr = nullptr;

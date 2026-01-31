@@ -105,8 +105,17 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    if (config->prologue == nullptr && config->epilogue == nullptr) {
-        patch__set_error("At least one callback must be provided");
+    // Validate mode: either simple replacement OR callbacks, not both
+    bool has_replacement = config->replacement != nullptr;
+    bool has_callbacks   = config->prologue != nullptr || config->epilogue != nullptr;
+
+    if (has_replacement && has_callbacks) {
+        patch__set_error("Cannot specify both replacement and prologue/epilogue callbacks");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!has_replacement && !has_callbacks) {
+        patch__set_error("Must specify either replacement or at least one callback");
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -146,26 +155,42 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     }
 
     // Create trampoline (holds relocated prologue + jump back to original)
-    err = patch__trampoline_create(config->target, match.prologue_size, &h->trampoline);
+    // For NOP sleds (patchable_function_entry), skip relocation since NOPs have no
+    // PC-relative references. The has_pc_relative flag tells us if we need relocation.
+    err = patch__trampoline_create(config->target,
+                                   match.prologue_size,
+                                   match.has_pc_relative,
+                                   &h->trampoline);
     if (err != PATCH_SUCCESS) {
         free(h);
         return err;
     }
 
-    // Create dispatcher (invokes callbacks, calls trampoline, returns result)
-    err = patch__dispatcher_create(h, &h->dispatcher);
-    if (err != PATCH_SUCCESS) {
-        patch__trampoline_destroy(h->trampoline);
-        free(h);
-        return err;
+    // Determine detour destination based on mode
+    void *detour_dest;
+
+    if (has_replacement) {
+        // Simple mode: jump directly to replacement function (no dispatcher)
+        detour_dest   = config->replacement;
+        h->dispatcher = nullptr;
+    }
+    else {
+        // Callback mode: create dispatcher that invokes callbacks
+        err = patch__dispatcher_create(h, &h->dispatcher);
+        if (err != PATCH_SUCCESS) {
+            patch__trampoline_destroy(h->trampoline);
+            free(h);
+            return err;
+        }
+        detour_dest = h->dispatcher;
     }
 
-    // Write the detour at the original function - points to dispatcher
-    err = patch__write_detour(config->target,
-                              h->dispatcher,
-                              match.prologue_size);
+    // Write the detour at the original function
+    err = patch__write_detour(config->target, detour_dest, match.prologue_size);
     if (err != PATCH_SUCCESS) {
-        patch__dispatcher_destroy(h->dispatcher);
+        if (h->dispatcher != nullptr) {
+            patch__dispatcher_destroy(h->dispatcher);
+        }
         patch__trampoline_destroy(h->trampoline);
         free(h);
         return err;
@@ -191,8 +216,10 @@ patch_remove(patch_handle_t *handle)
         return err;
     }
 
-    // Free dispatcher and trampoline
-    patch__dispatcher_destroy(handle->dispatcher);
+    // Free dispatcher (may be nullptr in simple replacement mode)
+    if (handle->dispatcher != nullptr) {
+        patch__dispatcher_destroy(handle->dispatcher);
+    }
     patch__trampoline_destroy(handle->trampoline);
 
     // Free handle
@@ -306,4 +333,13 @@ patch_context_get_original(patch_context_t *ctx)
         return nullptr;
     }
     return ctx->handle->trampoline->code;
+}
+
+void *
+patch_get_trampoline(patch_handle_t *handle)
+{
+    if (handle == nullptr || handle->trampoline == nullptr) {
+        return nullptr;
+    }
+    return handle->trampoline->code;
 }

@@ -48,7 +48,11 @@ struct patch_context {
 };
 
 // Trampoline management
-patch_error_t patch__trampoline_create(void *target, size_t prologue_size, patch__trampoline_t **out);
+// If needs_relocation is false (e.g., NOP sled), skip PC-relative fixups.
+patch_error_t patch__trampoline_create(void            *target,
+                                       size_t           prologue_size,
+                                       bool             needs_relocation,
+                                       patch__trampoline_t **out);
 void          patch__trampoline_destroy(patch__trampoline_t *tramp);
 
 // Dispatcher management - the dispatcher invokes callbacks and calls trampoline
