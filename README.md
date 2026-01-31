@@ -217,6 +217,13 @@ typedef struct {
     patch_epilogue_fn epilogue;     // Called after original
     void *prologue_user_data;
     void *epilogue_user_data;
+
+#ifdef PATCH_HAVE_LIBFFI
+    // Optional: FFI type info for full argument forwarding
+    ffi_type **arg_types;      // Array of argument types
+    ffi_type  *return_type;    // Return type (default: ffi_type_uint64)
+    size_t     arg_count;      // Number of arguments
+#endif
 } patch_config_t;
 ```
 
@@ -287,12 +294,66 @@ patch/
     └── TESTING.md
 ```
 
+## Optional libffi Support
+
+When libffi is available, you can enable full argument forwarding for functions with:
+- **Floating-point arguments** (float, double)
+- **Stack arguments** (beyond register count: 6 on x86-64, 8 on ARM64)
+- **Mixed int/FP arguments**
+
+### Building with libffi
+
+```bash
+# Auto-detect (enabled if found)
+meson setup build
+
+# Require libffi
+meson setup build -Duse_libffi=true
+```
+
+### Usage
+
+```c
+#include "patch/patch.h"
+
+// Function: double compute(int n, double x, double y, ..., double z)  // 9 args
+bool my_prologue(patch_context_t *ctx, void *ud) {
+    // Inspect all arguments including FP and stack args
+    return true;  // Call original - FFI forwards all args correctly
+}
+
+#ifdef PATCH_HAVE_LIBFFI
+ffi_type *arg_types[] = {
+    &ffi_type_sint, &ffi_type_double, &ffi_type_double,
+    &ffi_type_double, &ffi_type_double, &ffi_type_double,
+    &ffi_type_double, &ffi_type_double, &ffi_type_double,
+};
+
+patch_config_t config = {
+    .target = (void *)compute,
+    .prologue = my_prologue,
+    .arg_types = arg_types,
+    .arg_count = 9,
+    .return_type = &ffi_type_double,
+};
+#endif
+```
+
+Without libffi, only register arguments are forwarded when the prologue returns `true`.
+
+## Thread Safety
+
+The library provides the following thread-safety guarantees:
+
+- **Install/remove/enable/disable**: These operations are serialized with a global mutex, making them safe to call from multiple threads concurrently.
+- **Concurrent hook execution**: Multiple threads can execute through the same hook simultaneously.
+- **Limitation**: Removing a hook while another thread is executing through it is NOT safe. Ensure no threads are calling the hooked function before removing it, or use appropriate synchronization in your code.
+
 ## Limitations
 
-- **Floating-point arguments**: Currently only integer registers are saved in callbacks
-- **Stack arguments**: Only register arguments are accessible (6 on x86-64, 8 on ARM64)
-- **Thread safety**: Install/remove are not thread-safe during concurrent execution
 - **macOS code patching**: Not available due to hardware restrictions
+- **FP/stack args without libffi**: Only register arguments forwarded to original
+- **Use-after-remove**: Calling a function while its hook is being removed is undefined behavior
 
 ## License
 
