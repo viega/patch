@@ -25,9 +25,11 @@
 
 - [x] **Hot-swap hooks** - Replace a hook's callbacks without remove/reinstall cycle
 
-- [ ] **Watchpoint-guarded pointer hooks** - Hook function pointers (vtables, callbacks, GOT entries) with hardware watchpoint protection. When the program updates the pointer, automatically reinstall the detour and cache the new original. Uses debug registers (DR0-DR3 on x86-64, DBGWVR on ARM64). Returns error when watchpoints exhausted (no slow fallback).
+- [x] **Watchpoint-guarded pointer hooks** - Hook function pointers (vtables, callbacks, GOT entries) with hardware watchpoint protection. When the program updates the pointer, automatically reinstall the detour and cache the new original. Uses debug registers (DR0-DR3 on x86-64, DBGWVR on ARM64). Returns error when watchpoints exhausted (no slow fallback).
 
 - [x] **vtable hooking** - Subsumed by watchpoint-guarded pointer hooks
+
+- [ ] **GitHub Actions CI** - Add workflow for automated testing on Linux (x86-64 and ARM64) with hardware watchpoint support via `sysctl kernel.perf_event_paranoid=-1`
 
 - [ ] **Hook discovery** - Detect if a function is already hooked by another library
 
