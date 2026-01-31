@@ -414,6 +414,8 @@ static bool match_frame_setup(const uint8_t *code, size_t avail, pattern_match_t
 static bool match_frame_setup_alt(const uint8_t *code, size_t avail, pattern_match_t *out);
 static bool match_frame_setup_preindex_callee(const uint8_t *code, size_t avail, pattern_match_t *out);
 static bool match_no_frame_pointer(const uint8_t *code, size_t avail, pattern_match_t *out);
+static bool match_pac(const uint8_t *code, size_t avail, pattern_match_t *out);
+static bool match_shadow_call_stack(const uint8_t *code, size_t avail, pattern_match_t *out);
 
 // Pattern: Standard frame setup
 // stp x29, x30, [sp, #-N]!
@@ -787,6 +789,57 @@ is_cbz_cbnz(uint32_t insn)
     return (insn & 0x7E000000) == 0x34000000;
 }
 
+// Check if instruction is STR x30, [x18], #imm (shadow call stack push)
+// This is the prologue instruction added by -fsanitize=shadow-call-stack
+static inline bool
+is_scs_push(uint32_t insn)
+{
+    // STR (immediate) post-index: size=11 opc=00 0 imm9 01 Rn Rt
+    // For SCS: Rn=x18, Rt=x30
+    // Encoding: 0xF800xxxx where xx depends on imm9, but Rn=18 and Rt=30
+    // Mask: 0xFFE00FFF (ignore imm9 bits 12-20)
+    // Expected: 0xF800065E (with imm9=0)
+    return (insn & 0xFFE00FFF) == 0xF800065E;
+}
+
+// Pattern: Shadow Call Stack prologue
+// Source: Clang/GCC with -fsanitize=shadow-call-stack on ARM64
+// Pattern: str x30, [x18], #8; <standard_prologue>
+// The shadow call stack push is inserted BEFORE the normal prologue.
+// See PATTERNS.md for full documentation.
+static bool
+match_shadow_call_stack(const uint8_t *code, size_t avail, pattern_match_t *out)
+{
+    if (avail < 8) {
+        return false;
+    }
+
+    uint32_t insn0 = read_insn(code);
+
+    // First instruction: STR x30, [x18], #imm (SCS push)
+    if (!is_scs_push(insn0)) {
+        return false;
+    }
+
+    // Try to match the rest as a standard prologue
+    pattern_match_t sub = {0};
+    if (match_pac(code + 4, avail - 4, &sub) ||
+        match_frame_setup(code + 4, avail - 4, &sub) ||
+        match_frame_setup_alt(code + 4, avail - 4, &sub) ||
+        match_frame_setup_preindex_callee(code + 4, avail - 4, &sub)) {
+
+        out->matched         = true;
+        out->pattern_name    = "arm64_shadow_call_stack";
+        out->prologue_size   = 4 + sub.prologue_size;
+        out->min_patch_size  = 4;
+        out->has_pc_relative = sub.has_pc_relative;
+
+        return true;
+    }
+
+    return false;
+}
+
 // Pattern: -fomit-frame-pointer prologue
 // Source: GCC/Clang with -fomit-frame-pointer on ARM64
 // Pattern: stp x30, xN, [sp, #-M]! or stp xN, x30, [sp, #-M]!
@@ -970,6 +1023,13 @@ static pattern_handler_t handler_no_frame_pointer = {
     .match       = match_no_frame_pointer,
 };
 
+static pattern_handler_t handler_shadow_call_stack = {
+    .name        = "arm64_shadow_call_stack",
+    .description = "Shadow call stack: str x30,[x18],#8 + prologue (-fsanitize=shadow-call-stack)",
+    .priority    = 115, // Higher than PAC since SCS comes before PAC
+    .match       = match_shadow_call_stack,
+};
+
 void
 pattern_init_arm64(void)
 {
@@ -980,6 +1040,7 @@ pattern_init_arm64(void)
     initialized = true;
 
     pattern_register(&handler_patchable);
+    pattern_register(&handler_shadow_call_stack);
     pattern_register(&handler_bti);
     pattern_register(&handler_pac);
     pattern_register(&handler_frame_setup);

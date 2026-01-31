@@ -1253,6 +1253,35 @@ static void test_compiler_flag_compatibility(void)
     }
 }
 
+#ifdef PATCH_ARCH_ARM64
+// Simulated shadow call stack prologue for pattern testing
+// This tests that we correctly recognize the SCS pattern without needing
+// to compile the test binary with -fsanitize=shadow-call-stack
+static uint32_t scs_test_prologue[] __attribute__((aligned(4))) = {
+    0xf800865e,  // str x30, [x18], #8 (SCS push)
+    0xa9be7bfd,  // stp x29, x30, [sp, #-32]!
+    0xf9000bf3,  // str x19, [sp, #16]
+    0x910003fd,  // mov x29, sp
+    0xd65f03c0,  // ret (placeholder)
+};
+
+static void test_shadow_call_stack_pattern(void)
+{
+    printf("Test: Shadow call stack pattern recognition...\n");
+
+    // Test that we recognize the SCS prologue pattern
+    patch_error_t err = patch_can_install((void*)scs_test_prologue);
+
+    if (err == PATCH_SUCCESS) {
+        printf("  SCS prologue pattern: RECOGNIZED\n");
+        TEST_PASS();
+    } else {
+        printf("  SCS prologue pattern: %s\n", patch_get_error_details());
+        TEST_FAIL("Shadow call stack pattern not recognized");
+    }
+}
+#endif
+
 // ============================================================================
 // Section 8: Symbol-Based Hooking API
 // ============================================================================
@@ -2668,6 +2697,9 @@ int main(void)
     test_platform_detection();
     test_pattern_recognition();
     test_compiler_flag_compatibility();
+#ifdef PATCH_ARCH_ARM64
+    test_shadow_call_stack_pattern();
+#endif
 
     // Section 8: Symbol-Based Hooking
     printf("\n--- Section 8: Symbol-Based Hooking ---\n\n");

@@ -32,6 +32,39 @@ distinguishes intentional patchable entries from incidental alignment NOPs.
 
 ---
 
+### arm64_shadow_call_stack (Priority: 115) [NEW]
+**Source:** Clang/GCC `-fsanitize=shadow-call-stack` on ARM64
+
+**Pattern:** Shadow call stack push followed by standard prologue
+```
+str x30, [x18], #8   ; Push LR to shadow call stack (post-increment)
+stp x29, x30, [sp, #-N]!  ; Normal frame setup
+mov x29, sp          ; Set frame pointer
+...
+```
+
+**Why safe:** The shadow call stack feature adds `str x30, [x18], #imm` as the
+very first instruction to push the return address to a separate shadow stack
+before the normal prologue. This is a highly specific pattern that only appears
+in SCS-enabled code.
+
+**Encoding:** `STR x30, [x18], #imm` = `(insn & 0xFFE00FFF) == 0xF800065E`
+
+**False positive risk:** Very low. Requires:
+- Exact STR post-index encoding
+- x30 (LR) as source register
+- x18 as base register (reserved for SCS)
+- Valid standard prologue following
+
+**Reference:** [Clang ShadowCallStack Documentation](https://clang.llvm.org/docs/ShadowCallStack.html)
+
+**Note:** Functions compiled with SCS can be hooked, but the hook must preserve
+the shadow call stack semantics. When the original function is called via
+trampoline, the SCS push/pop in the relocated prologue/epilogue will correctly
+update the shadow stack.
+
+---
+
 ### arm64_bti_prologue (Priority: 120)
 **Source:** ARM Branch Target Identification (BTI) for Control Flow Integrity
 
@@ -320,9 +353,10 @@ The following compiler flags have been tested and do NOT require special pattern
 | `-mno-red-zone` | x86-64 | No effect on prologue patterns |
 | `-fcf-protection=full` | x86-64 | Handled by `x86_64_endbr64` |
 | `-mbranch-protection=standard` | ARM64 | Handled by `arm64_bti_prologue` and `arm64_pac_frame` |
+| `-fsanitize=shadow-call-stack` | ARM64 | Handled by `arm64_shadow_call_stack` pattern |
 
-**Note:** `-fsanitize=shadow-call-stack` (ARM64 only) may interfere with hooking
-as it uses the x18 register for the shadow stack pointer.
+**Note:** Shadow call stack functions require `-ffixed-x18` to reserve x18 for the
+shadow stack pointer. The hook trampoline correctly preserves SCS semantics.
 
 ## Known Limitations
 

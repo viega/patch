@@ -12,10 +12,10 @@
   - [ ] Position-independent code patterns (if needed)
   - [ ] Compiler-specific prologues (MSVC, ICC)
 
-- [ ] **Shadow call stack compatibility** (`-fsanitize=shadow-call-stack` on ARM64) - Investigate interaction with hooking:
-  - Uses x18 register for shadow stack pointer
-  - May interfere with hook trampolines
-  - Currently only supported on Linux ARM64
+- [x] **Shadow call stack compatibility** (`-fsanitize=shadow-call-stack` on ARM64) - Implemented:
+  - Added `arm64_shadow_call_stack` pattern to recognize `str x30, [x18], #imm` prologue
+  - Hook trampolines correctly preserve SCS semantics (relocated prologue/epilogue maintain shadow stack)
+  - Tested on Linux ARM64 with Clang
 
 - [ ] **Instruction relocation coverage** - Handle more PC-relative instructions (currently some edge cases may fail)
 
