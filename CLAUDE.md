@@ -550,6 +550,40 @@ The library parameter can be:
 - `NULL` — Search all loaded libraries (uses RTLD_DEFAULT)
 - Library path — Load and search that specific library
 
+## GOT/PLT Hooking
+
+For imported functions, GOT (Global Offset Table) hooking is available as an alternative to code patching:
+
+```c
+// Force GOT hooking
+patch_config_t config = {
+    .replacement = my_malloc,
+    .method = PATCH_METHOD_GOT,
+};
+patch_install_symbol("malloc", NULL, &config, &handle);
+
+// AUTO mode (default): tries GOT first, falls back to code patching
+patch_config_t config = {
+    .replacement = my_func,
+    .method = PATCH_METHOD_AUTO,
+};
+```
+
+**Method selection:**
+- `PATCH_METHOD_AUTO` — Try GOT first, fall back to code patching (default)
+- `PATCH_METHOD_GOT` — Force GOT hooking, fail if no GOT entry
+- `PATCH_METHOD_CODE` — Force code patching
+
+**GOT hooking advantages:**
+- No instruction decoding or relocation needed
+- Works on any imported function (no prologue pattern matching)
+- Simpler and more reliable for external functions
+
+**GOT hooking limitations:**
+- Only works for imported functions (calls through PLT)
+- Does not support prologue/epilogue callbacks (replacement only)
+- Per-module (each shared object has its own GOT)
+
 ## Code Style
 
 - Public symbols: `patch_` prefix

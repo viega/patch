@@ -1,9 +1,14 @@
+#define _GNU_SOURCE
+
 #include "platform.h"
 
 #include "patch/patch_arch.h"
 #include "../patch_internal.h"
 
+#include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
+#include <link.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -253,4 +258,130 @@ platform_write_code(void *addr, const void *data, size_t size)
     platform_flush_icache(addr, size);
 
     return PATCH_SUCCESS;
+}
+
+// ============================================================================
+// GOT/PLT Hooking Support
+// ============================================================================
+
+// Context for dl_iterate_phdr callback
+typedef struct {
+    const char *symbol;      // Symbol we're looking for
+    void      **got_entry;   // Output: pointer to GOT slot
+    bool        found;       // Set to true when found
+} got_search_ctx_t;
+
+// Callback for dl_iterate_phdr - searches for GOT entry in each loaded object
+static int
+find_got_callback(struct dl_phdr_info *info, size_t size, void *data)
+{
+    (void)size;
+    got_search_ctx_t *ctx = (got_search_ctx_t *)data;
+
+    // Already found in a previous object
+    if (ctx->found) {
+        return 0;
+    }
+
+    // Get base address of this object
+    ElfW(Addr) base = info->dlpi_addr;
+
+    // Find the DYNAMIC segment
+    const ElfW(Dyn) *dyn = nullptr;
+    for (size_t i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (const ElfW(Dyn) *)(base + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    }
+
+    if (dyn == nullptr) {
+        return 0; // No dynamic section, skip this object
+    }
+
+    // Parse dynamic entries to find what we need
+    // Note: d_ptr values are virtual addresses. For shared libraries loaded at
+    // address 0 (typical), we need to add base. For the main executable or
+    // libraries with a non-zero link address, they may already be correct.
+    // We detect this by checking if dlpi_addr is 0 (main executable usually).
+    const ElfW(Rela) *jmprel   = nullptr;
+    size_t            pltrelsz = 0;
+    const char       *strtab   = nullptr;
+    const ElfW(Sym)  *symtab   = nullptr;
+
+    for (const ElfW(Dyn) *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_JMPREL:
+            jmprel = (const ElfW(Rela) *)(d->d_un.d_ptr);
+            break;
+        case DT_PLTRELSZ:
+            pltrelsz = d->d_un.d_val;
+            break;
+        case DT_STRTAB:
+            strtab = (const char *)(d->d_un.d_ptr);
+            break;
+        case DT_SYMTAB:
+            symtab = (const ElfW(Sym) *)(d->d_un.d_ptr);
+            break;
+        }
+    }
+
+    // Need all four to proceed
+    if (jmprel == nullptr || pltrelsz == 0 || strtab == nullptr || symtab == nullptr) {
+        return 0;
+    }
+
+    // Iterate through PLT relocations
+    size_t relcount = pltrelsz / sizeof(ElfW(Rela));
+    for (size_t i = 0; i < relcount; i++) {
+        const ElfW(Rela) *rel = &jmprel[i];
+
+        // Get symbol index from relocation info
+#ifdef PATCH_ARCH_X86_64
+        size_t sym_idx = ELF64_R_SYM(rel->r_info);
+#else
+        size_t sym_idx = ELF64_R_SYM(rel->r_info);
+#endif
+
+        // Get symbol name
+        const char *name = strtab + symtab[sym_idx].st_name;
+
+        // Check if this is our symbol
+        if (strcmp(name, ctx->symbol) == 0) {
+            // Found it! r_offset is the GOT slot address (relative to base)
+            ctx->got_entry = (void **)(base + rel->r_offset);
+            ctx->found     = true;
+            return 1; // Stop iteration
+        }
+    }
+
+    return 0; // Continue to next object
+}
+
+patch_error_t
+platform_find_got_entry(const char *symbol, void ***got_entry)
+{
+    if (symbol == nullptr || got_entry == nullptr) {
+        patch__set_error("symbol and got_entry must not be nullptr");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    *got_entry = nullptr;
+
+    got_search_ctx_t ctx = {
+        .symbol    = symbol,
+        .got_entry = nullptr,
+        .found     = false,
+    };
+
+    // Search all loaded objects
+    dl_iterate_phdr(find_got_callback, &ctx);
+
+    if (ctx.found) {
+        *got_entry = ctx.got_entry;
+        return PATCH_SUCCESS;
+    }
+
+    patch__set_error("no GOT entry found for symbol '%s'", symbol);
+    return PATCH_ERR_NO_GOT_ENTRY;
 }

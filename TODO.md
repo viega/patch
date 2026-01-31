@@ -15,7 +15,7 @@
 
 ## New Features
 
-- [ ] **PLT/GOT hooking** - Hook imported functions via the PLT/GOT tables (simpler than code patching, works on more targets)
+- [x] **PLT/GOT hooking** - Hook imported functions via the PLT/GOT tables (simpler than code patching, works on more targets)
 
 - [ ] **Batch hook API** - `patch_install_batch()` to atomically install multiple hooks
 

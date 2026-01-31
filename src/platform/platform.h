@@ -38,3 +38,9 @@ void *platform_page_align(void *addr);
 // This is the preferred method for patching code on platforms with
 // strict memory protection (e.g., macOS with hardened runtime).
 patch_error_t platform_write_code(void *addr, const void *data, size_t size);
+
+// Find the GOT entry for a symbol.
+// Returns PATCH_SUCCESS and sets *got_entry to the GOT slot address if found.
+// Returns PATCH_ERR_NO_GOT_ENTRY if the symbol has no GOT entry.
+// The symbol must be an imported function (called through PLT/GOT).
+patch_error_t platform_find_got_entry(const char *symbol, void ***got_entry);

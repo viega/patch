@@ -43,6 +43,11 @@ struct patch_handle {
     struct patch_handle *chain_next;   // Next hook in chain (installed earlier)
     struct patch_handle *chain_prev;   // Previous hook in chain (installed later)
 
+    // GOT hooking - if true, this hook modifies a GOT entry instead of code
+    bool   is_got_hook;
+    void **got_entry;         // Pointer to the GOT slot we modified
+    void  *original_got_value; // Original value in the GOT (the real function)
+
 #ifdef PATCH_HAVE_LIBFFI
     ffi_cif   *ffi_cif;       // Prepared call interface (nullptr if not using FFI)
     ffi_type **ffi_arg_types; // Cached argument types (owned by handle)

@@ -431,6 +431,19 @@ patch_remove(patch_handle_t *handle)
 
     futex_mutex_lock(&g_patch_mutex);
 
+    // Handle GOT hooks specially
+    if (handle->is_got_hook) {
+        // Restore original GOT value
+        if (handle->got_entry != nullptr) {
+            *handle->got_entry = handle->original_got_value;
+        }
+        free(handle);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // Code patching path below
+
     // Check if this is the first hook in the chain (the one the detour points to)
     patch_handle_t *first_in_chain = patch__registry_find(handle->target);
     bool            is_first       = (first_in_chain == handle);
@@ -504,7 +517,17 @@ patch_disable(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
-    // Restore original bytes
+    // Handle GOT hooks specially
+    if (handle->is_got_hook) {
+        if (handle->got_entry != nullptr) {
+            *handle->got_entry = handle->original_got_value;
+        }
+        atomic_store(&handle->enabled, false);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // Restore original bytes (code patching)
     patch_error_t err = patch__restore_bytes(handle->target,
                                              handle->original_bytes,
                                              handle->patch_size);
@@ -531,6 +554,16 @@ patch_enable(patch_handle_t *handle)
     // Idempotent: calling enable on an already-enabled patch succeeds silently.
     // This simplifies caller logic and matches common expectations.
     if (atomic_load(&handle->enabled)) {
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // Handle GOT hooks specially
+    if (handle->is_got_hook) {
+        if (handle->got_entry != nullptr) {
+            *handle->got_entry = handle->detour_dest;
+        }
+        atomic_store(&handle->enabled, true);
         futex_mutex_unlock(&g_patch_mutex);
         return PATCH_SUCCESS;
     }
@@ -642,7 +675,17 @@ patch_context_get_original(patch_context_t *ctx)
 void *
 patch_get_trampoline(patch_handle_t *handle)
 {
-    if (handle == nullptr || handle->trampoline == nullptr) {
+    if (handle == nullptr) {
+        return nullptr;
+    }
+
+    // For GOT hooks, return the original function pointer
+    if (handle->is_got_hook) {
+        return handle->original_got_value;
+    }
+
+    // For code hooks, return the trampoline
+    if (handle->trampoline == nullptr) {
         return nullptr;
     }
     return handle->trampoline->code;
@@ -717,6 +760,45 @@ patch_resolve_symbol(const char *symbol, const char *library, void **address)
     return PATCH_SUCCESS;
 }
 
+// Internal: Install a GOT hook (simple pointer replacement)
+static patch_error_t
+patch_install_got(void **got_entry, void *replacement, void *original, patch_handle_t **out)
+{
+    // Allocate handle
+    patch_handle_t *h = calloc(1, sizeof(patch_handle_t));
+    if (h == nullptr) {
+        patch__set_error("failed to allocate patch handle");
+        return PATCH_ERR_ALLOCATION_FAILED;
+    }
+
+    h->is_got_hook        = true;
+    h->got_entry          = got_entry;
+    h->original_got_value = original;
+    h->target             = original;  // Target is the original function
+    h->detour_dest        = replacement;
+    atomic_store(&h->enabled, true);
+
+    // GOT is typically in a writable data segment, so we can just write to it
+    // But we should ensure it's writable first
+    mem_prot_t prot;
+    if (platform_get_protection(got_entry, &prot) == PATCH_SUCCESS) {
+        if (prot != MEM_PROT_RW && prot != MEM_PROT_RWX) {
+            // Need to make it writable
+            if (platform_protect(got_entry, sizeof(void *), MEM_PROT_RW) != PATCH_SUCCESS) {
+                free(h);
+                patch__set_error("failed to make GOT entry writable");
+                return PATCH_ERR_MEMORY_PROTECTION;
+            }
+        }
+    }
+
+    // Write the new value
+    *got_entry = replacement;
+
+    *out = h;
+    return PATCH_SUCCESS;
+}
+
 patch_error_t
 patch_install_symbol(const char           *symbol,
                      const char           *library,
@@ -738,17 +820,67 @@ patch_install_symbol(const char           *symbol,
 
     *handle = nullptr;
 
-    // Resolve the symbol
+    patch_method_t method = config->method;
+
+    // Resolve the symbol to get the real function address
     void         *target = nullptr;
     patch_error_t err    = patch_resolve_symbol(symbol, library, &target);
     if (err != PATCH_SUCCESS) {
         return err;
     }
 
-    // Create a copy of the config with the resolved target
+    // Try GOT hooking first if AUTO or GOT method
+    if (method == PATCH_METHOD_AUTO || method == PATCH_METHOD_GOT) {
+        void **got_entry = nullptr;
+        err              = platform_find_got_entry(symbol, &got_entry);
+
+        if (err == PATCH_SUCCESS && got_entry != nullptr) {
+            // Found a GOT entry - use GOT hooking
+            void *replacement = config->replacement;
+
+            // For GOT hooking, we need a replacement function
+            // Callback mode (prologue/epilogue) is not supported with GOT hooking
+            if (replacement == nullptr) {
+                if (config->prologue != nullptr || config->epilogue != nullptr) {
+                    patch__set_error("GOT hooking does not support prologue/epilogue callbacks; "
+                                     "use replacement mode or PATCH_METHOD_CODE");
+                    if (method == PATCH_METHOD_GOT) {
+                        return PATCH_ERR_INVALID_ARGUMENT;
+                    }
+                    // Fall through to code patching for AUTO mode
+                    goto try_code_patching;
+                }
+            }
+
+            if (replacement != nullptr) {
+                futex_mutex_lock(&g_patch_mutex);
+                err = patch_install_got(got_entry, replacement, target, handle);
+                futex_mutex_unlock(&g_patch_mutex);
+                return err;
+            }
+        }
+
+        // No GOT entry found
+        if (method == PATCH_METHOD_GOT) {
+            patch__set_error("no GOT entry found for symbol '%s'", symbol);
+            return PATCH_ERR_NO_GOT_ENTRY;
+        }
+        // Fall through to code patching for AUTO mode
+    }
+
+try_code_patching:
+    // Use code patching
+    if (method == PATCH_METHOD_GOT) {
+        // Should not reach here - GOT-only mode but no GOT entry
+        patch__set_error("no GOT entry found for symbol '%s'", symbol);
+        return PATCH_ERR_NO_GOT_ENTRY;
+    }
+
+    // Create a copy of the config with the resolved target and force CODE method
     patch_config_t resolved_config = *config;
     resolved_config.target         = target;
+    resolved_config.method         = PATCH_METHOD_CODE;
 
-    // Install the patch
+    // Install the patch using code patching
     return patch_install(&resolved_config, handle);
 }

@@ -182,3 +182,13 @@ platform_page_align(void *addr)
     uintptr_t a  = (uintptr_t)addr;
     return (void *)(a & ~(ps - 1));
 }
+
+patch_error_t
+platform_find_got_entry(const char *symbol, void ***got_entry)
+{
+    (void)symbol;
+    (void)got_entry;
+    // GOT/PLT hooking requires ELF parsing, not supported on macOS
+    // macOS uses different mechanisms (dyld interposing, etc.)
+    return PATCH_ERR_NO_GOT_ENTRY;
+}

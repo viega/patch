@@ -1332,6 +1332,150 @@ static void test_install_symbol_invalid(void)
 
     TEST_PASS();
 }
+
+// ============================================================================
+// Section 9: GOT/PLT Hooking
+// ============================================================================
+
+static int g_got_hook_call_count = 0;
+static int (*g_original_atoi)(const char *) = NULL;
+
+static int got_hook_atoi(const char *str)
+{
+    g_got_hook_call_count++;
+    // Call original and add 1000
+    return g_original_atoi(str) + 1000;
+}
+
+static void test_got_hooking_basic(void)
+{
+    printf("Test: GOT hooking basic...\n");
+
+    g_got_hook_call_count = 0;
+
+    // Force GOT method
+    patch_config_t config = {
+        .replacement = (void *)got_hook_atoi,
+        .method = PATCH_METHOD_GOT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
+    if (err == PATCH_ERR_NO_GOT_ENTRY) {
+        printf("  No GOT entry for atoi (may be inlined or statically linked)\n");
+        TEST_SKIP("no GOT entry");
+        return;
+    }
+
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot hook atoi via GOT: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook via GOT");
+        return;
+    }
+
+    // Save original for our hook to call
+    g_original_atoi = (int (*)(const char *))patch_get_trampoline(handle);
+    assert(g_original_atoi != NULL);
+
+    // Call atoi - should go through our hook
+    int result = atoi("42");
+    assert(result == 1042);  // 42 + 1000
+    assert(g_got_hook_call_count == 1);
+
+    result = atoi("100");
+    assert(result == 1100);  // 100 + 1000
+    assert(g_got_hook_call_count == 2);
+
+    patch_remove(handle);
+
+    // After removal, should work normally
+    g_got_hook_call_count = 0;
+    result = atoi("50");
+    assert(result == 50);
+    assert(g_got_hook_call_count == 0);
+
+    TEST_PASS();
+}
+
+static void test_got_hooking_disable_enable(void)
+{
+    printf("Test: GOT hooking disable/enable...\n");
+
+    g_got_hook_call_count = 0;
+
+    patch_config_t config = {
+        .replacement = (void *)got_hook_atoi,
+        .method = PATCH_METHOD_GOT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("cannot hook atoi via GOT");
+        return;
+    }
+
+    g_original_atoi = (int (*)(const char *))patch_get_trampoline(handle);
+
+    // Hook is active
+    int result = atoi("10");
+    assert(result == 1010);
+    assert(g_got_hook_call_count == 1);
+
+    // Disable hook
+    err = patch_disable(handle);
+    assert(err == PATCH_SUCCESS);
+
+    // Should bypass hook now
+    result = atoi("10");
+    assert(result == 10);
+    assert(g_got_hook_call_count == 1);  // No change
+
+    // Re-enable hook
+    err = patch_enable(handle);
+    assert(err == PATCH_SUCCESS);
+
+    // Hook active again
+    result = atoi("10");
+    assert(result == 1010);
+    assert(g_got_hook_call_count == 2);
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_got_method_auto(void)
+{
+    printf("Test: GOT hooking with AUTO method...\n");
+
+    g_got_hook_call_count = 0;
+
+    // AUTO method - should try GOT first
+    patch_config_t config = {
+        .replacement = (void *)got_hook_atoi,
+        .method = PATCH_METHOD_AUTO,  // Default
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
+
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot hook atoi: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook atoi");
+        return;
+    }
+
+    g_original_atoi = (int (*)(const char *))patch_get_trampoline(handle);
+
+    // Should work regardless of which method was used
+    int result = atoi("25");
+    assert(result == 1025);
+
+    patch_remove(handle);
+    TEST_PASS();
+}
 #endif
 
 // ============================================================================
@@ -1445,6 +1589,21 @@ int main(void)
     TEST_SKIP("Low-level API not available on macOS");
     printf("Test: Install by symbol with invalid inputs...\n");
     TEST_SKIP("Low-level API not available on macOS");
+#endif
+
+    // Section 9: GOT/PLT Hooking
+    printf("\n--- Section 9: GOT/PLT Hooking ---\n\n");
+#ifndef PATCH_PLATFORM_DARWIN
+    test_got_hooking_basic();
+    test_got_hooking_disable_enable();
+    test_got_method_auto();
+#else
+    printf("Test: GOT hooking basic...\n");
+    TEST_SKIP("GOT hooking not available on macOS");
+    printf("Test: GOT hooking disable/enable...\n");
+    TEST_SKIP("GOT hooking not available on macOS");
+    printf("Test: GOT hooking with AUTO method...\n");
+    TEST_SKIP("GOT hooking not available on macOS");
 #endif
 
     // Summary

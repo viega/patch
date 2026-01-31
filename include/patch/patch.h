@@ -92,7 +92,29 @@ typedef enum {
 
     /** Symbol not found in specified library or process. */
     PATCH_ERR_SYMBOL_NOT_FOUND,
+
+    /** No GOT entry found for the symbol (when PATCH_METHOD_GOT requested). */
+    PATCH_ERR_NO_GOT_ENTRY,
 } patch_error_t;
+
+/**
+ * @brief Hooking method selection.
+ *
+ * Controls how a function is hooked. AUTO (the default) tries GOT hooking
+ * first for imported symbols, falling back to code patching.
+ */
+typedef enum {
+    /** Automatic selection: try GOT first, fall back to code patching. */
+    PATCH_METHOD_AUTO = 0,
+
+    /** Force GOT/PLT hooking. Fails if no GOT entry exists for the symbol.
+     *  Only works for imported functions (calls through PLT). */
+    PATCH_METHOD_GOT,
+
+    /** Force code patching. Modifies the function's prologue directly.
+     *  Works for any function with a recognized prologue pattern. */
+    PATCH_METHOD_CODE,
+} patch_method_t;
 
 /**
  * @brief Opaque handle to an installed patch.
@@ -201,6 +223,18 @@ typedef struct {
 
     /** User data passed to epilogue callback. */
     void *epilogue_user_data;
+
+    /**
+     * Hooking method selection (default: PATCH_METHOD_AUTO).
+     *
+     * - PATCH_METHOD_AUTO: Try GOT hooking first (for imported symbols),
+     *   fall back to code patching if no GOT entry found.
+     * - PATCH_METHOD_GOT: Force GOT hooking, fail if no GOT entry.
+     * - PATCH_METHOD_CODE: Force code patching.
+     *
+     * GOT hooking only works with patch_install_symbol(), not patch_install().
+     */
+    patch_method_t method;
 
 #ifdef PATCH_HAVE_LIBFFI
     /**
