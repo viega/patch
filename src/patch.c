@@ -1,6 +1,7 @@
 #include "patch_internal.h"
 
 #include "arch/arch.h"
+#include "breakpoint.h"
 #include "futex.h"
 #include "pattern/pattern.h"
 #include "platform/platform.h"
@@ -260,20 +261,48 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     // Match prologue pattern - only needed for first hook on a target
     // When chaining, we reuse the match info from the existing hook
     pattern_match_t match;
+    bool            use_breakpoint = false;
+
     if (existing != nullptr) {
         // Chaining: reuse prologue info from existing hook
         match.matched        = true;
         match.prologue_size  = existing->patch_size;
         match.min_patch_size = existing->patch_size;
         match.has_pc_relative = true;  // Assume yes for safety when chaining
+
+        // If existing hook is breakpoint-based, we can't chain code patching onto it
+        if (existing->is_breakpoint_hook) {
+            patch__set_error("Cannot chain onto breakpoint-based hook");
+            futex_mutex_unlock(&g_patch_mutex);
+            return PATCH_ERR_INVALID_ARGUMENT;
+        }
     }
     else {
         // First hook: match the actual prologue
         match = pattern_match_prologue((const uint8_t *)config->target, 64);
         if (!match.matched) {
-            patch__set_error("No recognized prologue pattern at target");
-            futex_mutex_unlock(&g_patch_mutex);
-            return PATCH_ERR_PATTERN_UNRECOGNIZED;
+            // Pattern not recognized - check if we should try breakpoint fallback
+            if (config->method == PATCH_METHOD_CODE) {
+                // Explicit CODE method requested - fail
+                patch__set_error("No recognized prologue pattern at target");
+                futex_mutex_unlock(&g_patch_mutex);
+                return PATCH_ERR_PATTERN_UNRECOGNIZED;
+            }
+
+            if (config->method == PATCH_METHOD_AUTO ||
+                config->method == PATCH_METHOD_BREAKPOINT) {
+                // Try breakpoint-based hooking as fallback
+                use_breakpoint = true;
+            }
+            else {
+                patch__set_error("No recognized prologue pattern at target");
+                futex_mutex_unlock(&g_patch_mutex);
+                return PATCH_ERR_PATTERN_UNRECOGNIZED;
+            }
+        }
+        else if (config->method == PATCH_METHOD_BREAKPOINT) {
+            // Explicit breakpoint method requested
+            use_breakpoint = true;
         }
     }
 
@@ -290,7 +319,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     h->epilogue           = config->epilogue;
     h->prologue_user_data = config->prologue_user_data;
     h->epilogue_user_data = config->epilogue_user_data;
-    h->patch_size         = match.prologue_size;
+    h->patch_size         = use_breakpoint ? 0 : match.prologue_size;
     atomic_store(&h->enabled, true);
 
 #ifdef PATCH_HAVE_LIBFFI
@@ -334,6 +363,46 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
 #endif
 
     patch_error_t err;
+
+    // =========================================================================
+    // Breakpoint-based hooking path
+    // =========================================================================
+    if (use_breakpoint) {
+        // Breakpoint hooks don't support simple replacement mode currently
+        // (they use the dispatcher for signal handler integration)
+        if (has_replacement) {
+            patch__set_error("Breakpoint hooks require prologue/epilogue callbacks, "
+                             "not simple replacement");
+            free(h);
+            futex_mutex_unlock(&g_patch_mutex);
+            return PATCH_ERR_INVALID_ARGUMENT;
+        }
+
+        err = patch__breakpoint_install(h);
+        if (err != PATCH_SUCCESS) {
+#ifdef PATCH_HAVE_LIBFFI
+            if (h->ffi_cif != nullptr) {
+                free(h->ffi_cif);
+            }
+            if (h->ffi_arg_types != nullptr) {
+                free(h->ffi_arg_types);
+            }
+#endif
+            free(h);
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+
+        // Breakpoint hooks don't use the registry (they have their own hash table)
+        // and don't support chaining
+        *handle = h;
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // =========================================================================
+    // Standard code patching path
+    // =========================================================================
 
     if (existing != nullptr) {
         // Chaining onto existing hook - copy original bytes from existing chain
@@ -442,6 +511,32 @@ patch_remove(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
+    // Handle breakpoint hooks specially
+    if (handle->is_breakpoint_hook) {
+        patch_error_t err = patch__breakpoint_remove(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+
+#ifdef PATCH_HAVE_LIBFFI
+        if (handle->ffi_cif != nullptr) {
+            free(handle->ffi_cif);
+        }
+        if (handle->ffi_arg_types != nullptr) {
+            free(handle->ffi_arg_types);
+        }
+#endif
+        // Free dispatcher if present
+        if (handle->dispatcher != nullptr) {
+            patch__dispatcher_destroy(handle->dispatcher);
+        }
+
+        free(handle);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
     // Code patching path below
 
     // Check if this is the first hook in the chain (the one the detour points to)
@@ -527,6 +622,18 @@ patch_disable(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
+    // Handle breakpoint hooks specially
+    if (handle->is_breakpoint_hook) {
+        patch_error_t err = patch__breakpoint_disable(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
+        }
+        atomic_store(&handle->enabled, false);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
     // Restore original bytes (code patching)
     patch_error_t err = patch__restore_bytes(handle->target,
                                              handle->original_bytes,
@@ -562,6 +669,18 @@ patch_enable(patch_handle_t *handle)
     if (handle->is_got_hook) {
         if (handle->got_entry != nullptr) {
             *handle->got_entry = handle->detour_dest;
+        }
+        atomic_store(&handle->enabled, true);
+        futex_mutex_unlock(&g_patch_mutex);
+        return PATCH_SUCCESS;
+    }
+
+    // Handle breakpoint hooks specially
+    if (handle->is_breakpoint_hook) {
+        patch_error_t err = patch__breakpoint_enable(handle);
+        if (err != PATCH_SUCCESS) {
+            futex_mutex_unlock(&g_patch_mutex);
+            return err;
         }
         atomic_store(&handle->enabled, true);
         futex_mutex_unlock(&g_patch_mutex);

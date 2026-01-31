@@ -50,6 +50,7 @@ lib_sources = [
     'src/patch.c',
     'src/trampoline.c',
     'src/dispatcher.c',
+    'src/breakpoint.c',
     'src/pattern/registry.c',
 ] + arch_sources + platform_sources
 

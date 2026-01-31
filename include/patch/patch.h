@@ -95,6 +95,9 @@ typedef enum {
 
     /** No GOT entry found for the symbol (when PATCH_METHOD_GOT requested). */
     PATCH_ERR_NO_GOT_ENTRY,
+
+    /** Failed to install signal handler for breakpoint hooking. */
+    PATCH_ERR_SIGNAL_HANDLER,
 } patch_error_t;
 
 /**
@@ -104,7 +107,8 @@ typedef enum {
  * first for imported symbols, falling back to code patching.
  */
 typedef enum {
-    /** Automatic selection: try GOT first, fall back to code patching. */
+    /** Automatic selection: try GOT first, fall back to code patching,
+     *  then fall back to breakpoint hooking. */
     PATCH_METHOD_AUTO = 0,
 
     /** Force GOT/PLT hooking. Fails if no GOT entry exists for the symbol.
@@ -114,6 +118,11 @@ typedef enum {
     /** Force code patching. Modifies the function's prologue directly.
      *  Works for any function with a recognized prologue pattern. */
     PATCH_METHOD_CODE,
+
+    /** Force breakpoint-based hooking. Uses INT3 (x86-64) or BRK (ARM64)
+     *  instruction with a SIGTRAP handler. Works on any function but has
+     *  higher overhead due to signal handling per call. */
+    PATCH_METHOD_BREAKPOINT,
 } patch_method_t;
 
 /**

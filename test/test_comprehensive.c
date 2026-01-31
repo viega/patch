@@ -1766,6 +1766,262 @@ static void test_hot_swap_got_replacement(void)
 #endif
 
 // ============================================================================
+// Section 11: Breakpoint-Based Hooking
+// ============================================================================
+
+// Test function WITHOUT patchable_function_entry attribute
+// This forces breakpoint hooking since there's no NOP sled
+__attribute__((noinline))
+int no_nopsled_func(int a, int b)
+{
+    return a + b;
+}
+
+// Another test function without NOP sled
+__attribute__((noinline))
+int no_nopsled_multiply(int a, int b)
+{
+    return a * b;
+}
+
+// Callback trackers for breakpoint tests
+static int g_bp_prologue_calls = 0;
+static int g_bp_epilogue_calls = 0;
+
+static bool bp_test_prologue(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    g_bp_prologue_calls++;
+    return true;  // Call original
+}
+
+static void bp_test_epilogue(patch_context_t *ctx, void *ud)
+{
+    (void)ud;
+    g_bp_epilogue_calls++;
+    // Modify return value: add 1000
+    int *ret = (int *)patch_context_get_return(ctx);
+    *ret += 1000;
+    patch_context_set_return(ctx, ret, sizeof(*ret));
+}
+
+static bool bp_skip_prologue(patch_context_t *ctx, void *ud)
+{
+    (void)ud;
+    g_bp_prologue_calls++;
+    // Skip original and return a fixed value
+    int result = 42;
+    patch_context_set_return(ctx, &result, sizeof(result));
+    return false;  // Skip original
+}
+
+static void test_breakpoint_fallback(void)
+{
+    printf("Test: Breakpoint fallback for unrecognized patterns...\n");
+
+    // Reset counters
+    g_bp_prologue_calls = 0;
+    g_bp_epilogue_calls = 0;
+
+    // First verify the function works normally
+    int result = no_nopsled_func(10, 20);
+    assert(result == 30);
+
+    // Check that pattern matching fails for this function
+    patch_error_t err = patch_can_install((void *)no_nopsled_func);
+    if (err == PATCH_SUCCESS) {
+        // Pattern was recognized (might have a standard prologue)
+        // Still test breakpoint with explicit method below
+        printf("  Note: Pattern recognized for no_nopsled_func\n");
+    }
+    else {
+        printf("  Pattern unrecognized as expected: %s\n", patch_get_error_details());
+    }
+
+    // Install using AUTO method - should fall back to breakpoint
+    patch_config_t config = {
+        .target = (void *)no_nopsled_func,
+        .prologue = bp_test_prologue,
+        .epilogue = bp_test_epilogue,
+        .method = PATCH_METHOD_AUTO,
+    };
+
+    patch_handle_t *handle = NULL;
+    err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("breakpoint install failed");
+        return;
+    }
+
+    // Call the function - hook should be triggered
+    result = no_nopsled_func(10, 20);
+
+    // Prologue should have been called once
+    if (g_bp_prologue_calls != 1) {
+        printf("  Expected 1 prologue call, got %d\n", g_bp_prologue_calls);
+        patch_remove(handle);
+        TEST_FAIL("prologue not called correctly");
+        return;
+    }
+
+    // Epilogue should have been called once, modifying return value
+    if (g_bp_epilogue_calls != 1) {
+        printf("  Expected 1 epilogue call, got %d\n", g_bp_epilogue_calls);
+        patch_remove(handle);
+        TEST_FAIL("epilogue not called correctly");
+        return;
+    }
+
+    // Result should be 30 + 1000 = 1030
+    if (result != 1030) {
+        printf("  Expected result: 1030, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("return value not modified correctly");
+        return;
+    }
+
+    patch_remove(handle);
+
+    // After removal, function should work normally
+    g_bp_prologue_calls = 0;
+    result = no_nopsled_func(5, 5);
+    assert(result == 10);
+    assert(g_bp_prologue_calls == 0);
+
+    TEST_PASS();
+}
+
+static void test_explicit_breakpoint_method(void)
+{
+    printf("Test: Explicit PATCH_METHOD_BREAKPOINT...\n");
+
+    g_bp_prologue_calls = 0;
+
+    // Force breakpoint method even if pattern matching would succeed
+    patch_config_t config = {
+        .target = (void *)no_nopsled_multiply,
+        .prologue = bp_test_prologue,
+        .method = PATCH_METHOD_BREAKPOINT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install breakpoint hook: %s\n", patch_get_error_details());
+        TEST_SKIP("breakpoint install failed");
+        return;
+    }
+
+    // Call the function
+    int result = no_nopsled_multiply(3, 4);
+
+    if (g_bp_prologue_calls != 1) {
+        printf("  Expected 1 prologue call, got %d\n", g_bp_prologue_calls);
+        patch_remove(handle);
+        TEST_FAIL("prologue not called");
+        return;
+    }
+
+    if (result != 12) {
+        printf("  Expected result: 12, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("wrong result");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_breakpoint_disable_enable(void)
+{
+    printf("Test: Breakpoint disable/enable...\n");
+
+    g_bp_prologue_calls = 0;
+
+    patch_config_t config = {
+        .target = (void *)no_nopsled_func,
+        .prologue = bp_test_prologue,
+        .method = PATCH_METHOD_BREAKPOINT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("breakpoint install failed");
+        return;
+    }
+
+    // Call with hook enabled
+    int result = no_nopsled_func(1, 2);
+    assert(result == 3);
+    assert(g_bp_prologue_calls == 1);
+
+    // Disable hook
+    err = patch_disable(handle);
+    assert(err == PATCH_SUCCESS);
+
+    // Call with hook disabled - should bypass
+    result = no_nopsled_func(2, 3);
+    assert(result == 5);
+    assert(g_bp_prologue_calls == 1);  // No change
+
+    // Re-enable hook
+    err = patch_enable(handle);
+    assert(err == PATCH_SUCCESS);
+
+    // Call with hook re-enabled
+    result = no_nopsled_func(3, 4);
+    assert(result == 7);
+    assert(g_bp_prologue_calls == 2);
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_breakpoint_skip_original(void)
+{
+    printf("Test: Breakpoint hook skipping original function...\n");
+
+    g_bp_prologue_calls = 0;
+
+    patch_config_t config = {
+        .target = (void *)no_nopsled_func,
+        .prologue = bp_skip_prologue,
+        .method = PATCH_METHOD_BREAKPOINT,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        TEST_SKIP("breakpoint install failed");
+        return;
+    }
+
+    // Call - should return 42 instead of a+b
+    int result = no_nopsled_func(100, 200);
+
+    if (result != 42) {
+        printf("  Expected result: 42, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("skip original didn't work");
+        return;
+    }
+
+    if (g_bp_prologue_calls != 1) {
+        printf("  Expected 1 prologue call, got %d\n", g_bp_prologue_calls);
+        patch_remove(handle);
+        TEST_FAIL("prologue not called");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1913,6 +2169,13 @@ int main(void)
     printf("Test: Hot-swap GOT replacement function...\n");
     TEST_SKIP("GOT hooking not available on macOS");
 #endif
+
+    // Section 11: Breakpoint-Based Hooking
+    printf("\n--- Section 11: Breakpoint Hooking ---\n\n");
+    test_breakpoint_fallback();
+    test_explicit_breakpoint_method();
+    test_breakpoint_disable_enable();
+    test_breakpoint_skip_original();
 
     // Summary
     printf("\n========================================\n");

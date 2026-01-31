@@ -5,6 +5,7 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -13,35 +14,93 @@
 #endif
 
 // =============================================================================
-// Code Patching Stubs
+// Code Patching Support
 // =============================================================================
 //
-// macOS (especially Apple Silicon) enforces hardware W^X - pages cannot be
-// simultaneously writable and executable. This makes runtime code patching
-// of existing functions impossible. The unified macro layer uses pointer
-// indirection instead.
-//
-// These functions are stubbed to fail cleanly rather than maintaining complex
-// code that cannot succeed on modern macOS.
+// macOS enforces W^X - pages cannot be simultaneously writable and executable.
+// However, we CAN change protections sequentially: make writable (removing X),
+// write our data, then make executable (removing W). This enables runtime code
+// patching on macOS.
+
+// Forward declaration for patch__set_error from patch_internal.h
+void patch__set_error(const char *fmt, ...);
 
 patch_error_t
 platform_write_code(void *addr, const void *data, size_t size)
 {
-    (void)addr;
-    (void)data;
-    (void)size;
-    // Hardware W^X on Apple Silicon prevents code patching
-    return PATCH_ERR_MEMORY_PROTECTION;
+    void  *page        = platform_page_align(addr);
+    size_t ps          = platform_page_size();
+    size_t offset      = (uintptr_t)addr - (uintptr_t)page;
+    size_t region_size = ((offset + size + ps - 1) / ps) * ps;
+
+    // Step 1: Make writable (remove execute)
+    // Use VM_PROT_COPY to request a copy-on-write copy of the page
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (vm_address_t)page,
+                                  region_size,
+                                  FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        patch__set_error("vm_protect(RW|COPY) failed: %d", kr);
+        return PATCH_ERR_MEMORY_PROTECTION;
+    }
+
+    // Step 2: Write the data
+    memcpy(addr, data, size);
+
+    // Step 3: Make executable (remove write)
+    kr = vm_protect(mach_task_self(),
+                    (vm_address_t)page,
+                    region_size,
+                    FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        patch__set_error("vm_protect(RX) failed: %d", kr);
+        return PATCH_ERR_MEMORY_PROTECTION;
+    }
+
+    // Step 4: Flush icache (ARM64)
+    platform_flush_icache(addr, size);
+
+    return PATCH_SUCCESS;
+}
+
+static int
+prot_to_vm(mem_prot_t prot)
+{
+    switch (prot) {
+    case MEM_PROT_NONE:
+        return VM_PROT_NONE;
+    case MEM_PROT_R:
+        return VM_PROT_READ;
+    case MEM_PROT_RW:
+        return VM_PROT_READ | VM_PROT_WRITE;
+    case MEM_PROT_RX:
+        return VM_PROT_READ | VM_PROT_EXECUTE;
+    case MEM_PROT_RWX:
+        return VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+    }
+    return VM_PROT_NONE;
 }
 
 patch_error_t
 platform_protect(void *addr, size_t size, mem_prot_t prot)
 {
-    (void)addr;
-    (void)size;
-    (void)prot;
-    // Hardware W^X on Apple Silicon prevents changing code page protection
-    return PATCH_ERR_MEMORY_PROTECTION;
+    void  *page        = platform_page_align(addr);
+    size_t ps          = platform_page_size();
+    size_t offset      = (uintptr_t)addr - (uintptr_t)page;
+    size_t region_size = ((offset + size + ps - 1) / ps) * ps;
+
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (vm_address_t)page,
+                                  region_size,
+                                  FALSE,
+                                  prot_to_vm(prot));
+    if (kr != KERN_SUCCESS) {
+        return PATCH_ERR_MEMORY_PROTECTION;
+    }
+
+    return PATCH_SUCCESS;
 }
 
 patch_error_t

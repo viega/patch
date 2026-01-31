@@ -48,6 +48,12 @@ struct patch_handle {
     void **got_entry;         // Pointer to the GOT slot we modified
     void  *original_got_value; // Original value in the GOT (the real function)
 
+    // Breakpoint hooking - if true, this hook uses INT3/BRK with signal handler
+    bool   is_breakpoint_hook;
+    void  *breakpoint_addr;       // Address where breakpoint is installed
+    size_t breakpoint_insn_len;   // Length of original instruction (1 on x86, 4 on ARM64)
+    void  *breakpoint_trampoline; // Mini-trampoline: original insn + jump back
+
 #ifdef PATCH_HAVE_LIBFFI
     ffi_cif   *ffi_cif;       // Prepared call interface (nullptr if not using FFI)
     ffi_type **ffi_arg_types; // Cached argument types (owned by handle)
