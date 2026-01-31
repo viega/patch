@@ -6,10 +6,16 @@
 
 - [ ] **Variadic function support** - Handle `printf`-style functions properly
 
-- [ ] **More prologue patterns** - Add recognition for:
-  - Functions with stack canaries (`__stack_chk_guard`)
-  - Position-independent code patterns
-  - Compiler-specific prologues (MSVC, ICC)
+- [x] **More prologue patterns** - Added recognition for:
+  - [x] ARM64: frame_setup_alt, preindex_callee, null_check, no_frame_pointer
+  - [x] Functions with stack canaries work (canary setup is AFTER standard prologue)
+  - [ ] Position-independent code patterns (if needed)
+  - [ ] Compiler-specific prologues (MSVC, ICC)
+
+- [ ] **Shadow call stack compatibility** (`-fsanitize=shadow-call-stack` on ARM64) - Investigate interaction with hooking:
+  - Uses x18 register for shadow stack pointer
+  - May interfere with hook trampolines
+  - Currently only supported on Linux ARM64
 
 - [ ] **Instruction relocation coverage** - Handle more PC-relative instructions (currently some edge cases may fail)
 

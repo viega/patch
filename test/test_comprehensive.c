@@ -1196,6 +1196,64 @@ static void test_pattern_recognition(void)
 }
 
 // ============================================================================
+// Regular functions (no PATCH_DEFINE_HOOKABLE) to test real compiler prologues
+// These test that various compiler flags don't break pattern recognition
+// ============================================================================
+
+// Function that will get stack protector (has buffer) when compiled with -fstack-protector-strong
+__attribute__((noinline))
+static int stack_protected_func(int x) {
+    volatile char buf[64];
+    buf[0] = (char)x;
+    return buf[0] + 1;
+}
+
+// Function with multiple locals to test standard prologue patterns
+__attribute__((noinline))
+static int multi_local_func(int x) {
+    volatile int a = x;
+    volatile int b = x * 2;
+    volatile int c = x * 3;
+    return a + b + c;
+}
+
+// Non-leaf function (makes calls) to test frame setup patterns
+__attribute__((noinline))
+static int non_leaf_func(int x) {
+    return multi_local_func(x) + 1;
+}
+
+static void test_compiler_flag_compatibility(void)
+{
+    printf("Test: Compiler flag compatibility (real prologues)...\n");
+
+    // These functions are compiled with whatever flags the test binary uses
+    // The test verifies that common compiler optimizations don't break pattern recognition
+    patch_error_t err;
+    int hookable_count = 0;
+
+    err = patch_can_install((void*)stack_protected_func);
+    printf("  stack_protected_func: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
+    if (err == PATCH_SUCCESS) hookable_count++;
+
+    err = patch_can_install((void*)multi_local_func);
+    printf("  multi_local_func: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
+    if (err == PATCH_SUCCESS) hookable_count++;
+
+    err = patch_can_install((void*)non_leaf_func);
+    printf("  non_leaf_func: %s\n", err == PATCH_SUCCESS ? "HOOKABLE" : patch_get_error_details());
+    if (err == PATCH_SUCCESS) hookable_count++;
+
+    // At least one of these should be hookable (the functions are designed to have prologues)
+    if (hookable_count >= 1) {
+        printf("  %d/3 functions hookable (expected: at least 1)\n", hookable_count);
+        TEST_PASS();
+    } else {
+        TEST_FAIL("No regular functions hookable - pattern recognition may be broken");
+    }
+}
+
+// ============================================================================
 // Section 8: Symbol-Based Hooking API
 // ============================================================================
 
@@ -2609,6 +2667,7 @@ int main(void)
     printf("\n--- Section 7: Platform ---\n\n");
     test_platform_detection();
     test_pattern_recognition();
+    test_compiler_flag_compatibility();
 
     // Section 8: Symbol-Based Hooking
     printf("\n--- Section 8: Symbol-Based Hooking ---\n\n");

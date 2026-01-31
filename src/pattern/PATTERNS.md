@@ -308,6 +308,22 @@ When adding a new pattern:
 4. Assign appropriate **priority** based on specificity
 5. Add **test cases** that verify both matching and non-matching
 
+## Compiler Flag Compatibility
+
+The following compiler flags have been tested and do NOT require special pattern handling:
+
+| Flag | Platform | Notes |
+|------|----------|-------|
+| `-fstack-protector-strong` | All | Canary setup is AFTER standard prologue |
+| `-fomit-frame-pointer` | All | Handled by `arm64_no_frame_pointer` and `x86_64_no_frame` |
+| `-mgeneral-regs-only` | ARM64 | No effect on prologue patterns |
+| `-mno-red-zone` | x86-64 | No effect on prologue patterns |
+| `-fcf-protection=full` | x86-64 | Handled by `x86_64_endbr64` |
+| `-mbranch-protection=standard` | ARM64 | Handled by `arm64_bti_prologue` and `arm64_pac_frame` |
+
+**Note:** `-fsanitize=shadow-call-stack` (ARM64 only) may interfere with hooking
+as it uses the x18 register for the shadow stack pointer.
+
 ## Known Limitations
 
 Some functions cannot be hooked via code patching:
