@@ -2,6 +2,9 @@
 
 #include "patch/patch_arch.h"
 
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
@@ -242,12 +245,183 @@ platform_page_align(void *addr)
     return (void *)(a & ~(ps - 1));
 }
 
+// =============================================================================
+// Mach-O Symbol Pointer Hooking Support
+// =============================================================================
+//
+// macOS uses Mach-O binary format instead of ELF. The equivalent of ELF's GOT
+// (Global Offset Table) is the symbol pointer sections:
+//   - __DATA,__la_symbol_ptr: Lazy symbol pointers (most common)
+//   - __DATA_CONST,__got: Non-lazy GOT (hardened binaries)
+//   - __DATA,__nl_symbol_ptr: Non-lazy symbol pointers
+//   - __DATA,__got: Another GOT variant
+//
+// The indirect symbol table maps entries in these sections to symbol names.
+
+// Find a load command by type in a Mach-O header
+static const struct load_command *
+find_load_command(const struct mach_header_64 *header, uint32_t cmd_type)
+{
+    const uint8_t *ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)ptr;
+        if (lc->cmd == cmd_type) {
+            return lc;
+        }
+        ptr += lc->cmdsize;
+    }
+
+    return NULL;
+}
+
+// Find a section by segment and section name
+static const struct section_64 *
+find_section(const struct mach_header_64 *header,
+             const char                  *segment_name,
+             const char                  *section_name)
+{
+    const uint8_t *ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)ptr;
+
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg =
+                (const struct segment_command_64 *)lc;
+
+            if (strncmp(seg->segname, segment_name, 16) == 0) {
+                const struct section_64 *sections =
+                    (const struct section_64 *)(seg + 1);
+
+                for (uint32_t j = 0; j < seg->nsects; j++) {
+                    if (strncmp(sections[j].sectname, section_name, 16) == 0) {
+                        return &sections[j];
+                    }
+                }
+            }
+        }
+
+        ptr += lc->cmdsize;
+    }
+
+    return NULL;
+}
+
+// Search for a symbol in the indirect symbol table for a given section
+static void **
+find_symbol_pointer_in_section(const struct mach_header_64 *header,
+                               intptr_t                     slide,
+                               const struct section_64     *section,
+                               const char                  *symbol_name)
+{
+    // Get symtab command for symbol table and string table
+    const struct symtab_command *symtab =
+        (const struct symtab_command *)find_load_command(header, LC_SYMTAB);
+    if (!symtab) {
+        return NULL;
+    }
+
+    // Get dysymtab command for indirect symbol table
+    const struct dysymtab_command *dysymtab =
+        (const struct dysymtab_command *)find_load_command(header, LC_DYSYMTAB);
+    if (!dysymtab) {
+        return NULL;
+    }
+
+    // Get pointers to tables (relative to header, not slide-adjusted)
+    const struct nlist_64 *symbols =
+        (const struct nlist_64 *)((uintptr_t)header + symtab->symoff);
+    const char *strings = (const char *)((uintptr_t)header + symtab->stroff);
+    const uint32_t *indirect_syms =
+        (const uint32_t *)((uintptr_t)header + dysymtab->indirectsymoff);
+
+    // Section's starting index in the indirect symbol table
+    uint32_t indirect_start = section->reserved1;
+    uint32_t entry_count    = (uint32_t)(section->size / sizeof(void *));
+
+    // Symbol pointer array (needs slide adjustment since it's in memory)
+    void **symbol_ptrs = (void **)(section->addr + slide);
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint32_t sym_idx = indirect_syms[indirect_start + i];
+
+        // Skip special entries
+        if (sym_idx == INDIRECT_SYMBOL_LOCAL ||
+            sym_idx == INDIRECT_SYMBOL_ABS ||
+            sym_idx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+            continue;
+        }
+
+        // Bounds check
+        if (sym_idx >= symtab->nsyms) {
+            continue;
+        }
+
+        const char *name = strings + symbols[sym_idx].n_un.n_strx;
+
+        // Handle leading underscore (C symbols have it in Mach-O)
+        const char *name_to_compare = name;
+        if (name[0] == '_') {
+            name_to_compare = name + 1;
+        }
+
+        if (strcmp(name_to_compare, symbol_name) == 0) {
+            return &symbol_ptrs[i];
+        }
+    }
+
+    return NULL;
+}
+
 patch_error_t
 platform_find_got_entry(const char *symbol, void ***got_entry)
 {
-    (void)symbol;
-    (void)got_entry;
-    // GOT/PLT hooking requires ELF parsing, not supported on macOS
-    // macOS uses different mechanisms (dyld interposing, etc.)
+    if (symbol == NULL || got_entry == NULL) {
+        patch__set_error("symbol and got_entry must not be NULL");
+        return PATCH_ERR_INVALID_ARGUMENT;
+    }
+
+    *got_entry = NULL;
+
+    // Symbol pointer sections to search (in order of likelihood)
+    static const char *sections[][2] = {
+        {"__DATA", "__la_symbol_ptr"},
+        {"__DATA_CONST", "__got"},
+        {"__DATA", "__nl_symbol_ptr"},
+        {"__DATA", "__got"},
+    };
+
+    // Iterate all loaded images
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t i = 0; i < image_count; i++) {
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+
+        // Only handle 64-bit
+        if (header->magic != MH_MAGIC_64) {
+            continue;
+        }
+
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        // Try each symbol pointer section type
+        for (size_t j = 0; j < sizeof(sections) / sizeof(sections[0]); j++) {
+            const struct section_64 *sect =
+                find_section(header, sections[j][0], sections[j][1]);
+            if (!sect) {
+                continue;
+            }
+
+            void **slot =
+                find_symbol_pointer_in_section(header, slide, sect, symbol);
+            if (slot) {
+                *got_entry = slot;
+                return PATCH_SUCCESS;
+            }
+        }
+    }
+
+    patch__set_error("no symbol pointer entry found for '%s'", symbol);
     return PATCH_ERR_NO_GOT_ENTRY;
 }

@@ -1320,10 +1320,9 @@ static void test_install_symbol_invalid(void)
 }
 
 // ============================================================================
-// Section 9: GOT/PLT Hooking (ELF-only, Linux)
+// Section 9: GOT/PLT Hooking (Works on both Linux ELF and macOS Mach-O)
 // ============================================================================
 
-#ifndef PATCH_PLATFORM_DARWIN
 static int g_got_hook_call_count = 0;
 static int (*g_original_atoi)(const char *) = NULL;
 
@@ -1350,8 +1349,17 @@ static void test_got_hooking_basic(void)
     patch_error_t err = patch_install_symbol("atoi", NULL, &config, &handle);
 
     if (err == PATCH_ERR_NO_GOT_ENTRY) {
-        printf("  No GOT entry for atoi (may be inlined or statically linked)\n");
+        // On macOS, system library symbols (dyld shared cache) may not have
+        // modifiable symbol pointers. On Linux, symbol may be inlined.
+        printf("  No GOT entry for atoi (may be in dyld cache or inlined)\n");
         TEST_SKIP("no GOT entry");
+        return;
+    }
+
+    if (err == PATCH_ERR_MEMORY_PROTECTION) {
+        // macOS __DATA_CONST segment may resist modification
+        printf("  Cannot modify symbol pointer (read-only segment)\n");
+        TEST_SKIP("symbol pointer not writable");
         return;
     }
 
@@ -1439,7 +1447,7 @@ static void test_got_method_auto(void)
 
     g_got_hook_call_count = 0;
 
-    // AUTO method - should try GOT first
+    // AUTO method - should try code patching first, fall back to GOT or breakpoint
     patch_config_t config = {
         .replacement = (void *)got_hook_atoi,
         .method = PATCH_METHOD_AUTO,  // Default
@@ -1463,7 +1471,6 @@ static void test_got_method_auto(void)
     patch_remove(handle);
     TEST_PASS();
 }
-#endif // !PATCH_PLATFORM_DARWIN (Section 9: GOT/PLT)
 
 // ============================================================================
 // Section 10: Hot-Swap Hooks
@@ -1679,8 +1686,7 @@ static void test_hot_swap_invalid(void)
     TEST_PASS();
 }
 
-// Test hot-swap replacement for GOT hooks (ELF-only)
-#ifndef PATCH_PLATFORM_DARWIN
+// Test hot-swap replacement for GOT hooks
 static int g_got_hotswap_v1_calls = 0;
 static int g_got_hotswap_v2_calls = 0;
 static int (*g_got_original_atoi_hotswap)(const char *) = NULL;
@@ -1714,6 +1720,11 @@ static void test_hot_swap_got_replacement(void)
 
     if (err == PATCH_ERR_NO_GOT_ENTRY) {
         TEST_SKIP("no GOT entry for atoi");
+        return;
+    }
+
+    if (err == PATCH_ERR_MEMORY_PROTECTION) {
+        TEST_SKIP("symbol pointer not writable");
         return;
     }
 
@@ -1752,7 +1763,6 @@ static void test_hot_swap_got_replacement(void)
     patch_remove(handle);
     TEST_PASS();
 }
-#endif // !PATCH_PLATFORM_DARWIN (GOT hot-swap)
 
 // ============================================================================
 // Section 11: Breakpoint-Based Hooking
@@ -2087,20 +2097,11 @@ int main(void)
     test_install_by_symbol();
     test_install_symbol_invalid();
 
-    // Section 9: GOT/PLT Hooking (ELF-only, Linux)
-    printf("\n--- Section 9: GOT/PLT Hooking ---\n\n");
-#ifndef PATCH_PLATFORM_DARWIN
+    // Section 9: GOT/PLT Hooking (works on both Linux and macOS)
+    printf("\n--- Section 9: Symbol Pointer Hooking ---\n\n");
     test_got_hooking_basic();
     test_got_hooking_disable_enable();
     test_got_method_auto();
-#else
-    printf("Test: GOT hooking basic...\n");
-    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
-    printf("Test: GOT hooking disable/enable...\n");
-    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
-    printf("Test: GOT hooking with AUTO method...\n");
-    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
-#endif
 
     // Section 10: Hot-Swap Hooks
     printf("\n--- Section 10: Hot-Swap Hooks ---\n\n");
@@ -2108,12 +2109,7 @@ int main(void)
     test_hot_swap_epilogue();
     test_hot_swap_callbacks();
     test_hot_swap_invalid();
-#ifndef PATCH_PLATFORM_DARWIN
-    test_hot_swap_got_replacement();  // GOT hooking is ELF-only
-#else
-    printf("Test: Hot-swap GOT replacement function...\n");
-    TEST_SKIP("GOT hooking not available on macOS (ELF-only)");
-#endif
+    test_hot_swap_got_replacement();
 
     // Section 11: Breakpoint-Based Hooking
     printf("\n--- Section 11: Breakpoint Hooking ---\n\n");
