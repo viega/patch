@@ -9,6 +9,18 @@ project('patch', 'c',
 
 cc = meson.get_compiler('c')
 
+# Optional libffi dependency for full argument forwarding
+libffi_opt = get_option('use_libffi')
+if libffi_opt
+    libffi_dep = dependency('libffi', required: true)
+    add_project_arguments('-DPATCH_HAVE_LIBFFI=1', language: 'c')
+else
+    libffi_dep = dependency('libffi', required: false)
+    if libffi_dep.found()
+        add_project_arguments('-DPATCH_HAVE_LIBFFI=1', language: 'c')
+    endif
+endif
+
 # Detect architecture
 # Pattern recognition is merged into the arch files
 arch = host_machine.cpu_family()
@@ -45,6 +57,7 @@ lib_sources = [
 patch_lib = static_library('patch',
     lib_sources,
     include_directories: inc,
+    dependencies: libffi_dep.found() ? [libffi_dep] : [],
     install: true,
 )
 
@@ -61,30 +74,35 @@ install_headers(
     subdir: 'patch',
 )
 
-# Tests
+# Tests - all need libffi if available since patch.h includes ffi.h
+test_deps = libffi_dep.found() ? [libffi_dep] : []
+
 test_basic = executable('test_basic',
     'test/test_basic.c',
     include_directories: inc,
     link_with: patch_lib,
+    dependencies: test_deps,
 )
 
 test_hooks = executable('test_hooks',
     'test/test_hooks.c',
     include_directories: inc,
     link_with: patch_lib,
+    dependencies: test_deps,
 )
 
 test_realworld = executable('test_realworld',
     'test/test_realworld.c',
     include_directories: inc,
     link_with: patch_lib,
-    dependencies: [cc.find_library('dl', required: false)],
+    dependencies: test_deps + [cc.find_library('dl', required: false)],
 )
 
 test_comprehensive = executable('test_comprehensive',
     'test/test_comprehensive.c',
     include_directories: inc,
     link_with: patch_lib,
+    dependencies: test_deps,
 )
 
 test('basic', test_basic)

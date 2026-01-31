@@ -38,6 +38,13 @@ struct patch_handle {
     void                *epilogue_user_data;
     atomic_bool          enabled;
     mem_prot_t           original_prot;
+
+#ifdef PATCH_HAVE_LIBFFI
+    ffi_cif   *ffi_cif;       // Prepared call interface (nullptr if not using FFI)
+    ffi_type **ffi_arg_types; // Cached argument types (owned by handle)
+    ffi_type  *ffi_ret_type;  // Return type
+    size_t     ffi_arg_count; // Number of arguments
+#endif
 };
 
 // 128-bit type for FP/SIMD registers (XMM on x86-64, V on ARM64)

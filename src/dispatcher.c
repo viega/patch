@@ -54,21 +54,87 @@ patch__dispatch_full(patch_handle_t  *handle,
 
     uint64_t result;
     if (call_original) {
-        // Call the original function via trampoline
-        // Use function pointer with all register arguments
-        // Note: FP args are restored by the dispatcher stub before returning
-#ifdef PATCH_ARCH_X86_64
-        typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-        fn_t fn = (fn_t)trampoline;
-        result  = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
-#else
-        typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
-                                 uint64_t, uint64_t, uint64_t, uint64_t);
-        fn_t fn = (fn_t)trampoline;
-        result  = fn(args[0], args[1], args[2], args[3],
-                     args[4], args[5], args[6], args[7]);
+#ifdef PATCH_HAVE_LIBFFI
+        if (handle->ffi_cif != nullptr) {
+            // Use FFI for full argument forwarding (including stack and FP args)
+            void *ffi_arg_values[32];  // Max 32 args
+
+            // Track separate indices for integer and FP registers
+            // ABI treats them independently: int args go in int regs, FP args go in FP regs
+            size_t int_reg_idx = 0;
+            size_t fp_reg_idx  = 0;
+            size_t stack_idx   = 0;
+            uint64_t *stack    = (uint64_t *)caller_stack;
+
+            for (size_t i = 0; i < handle->ffi_arg_count; i++) {
+                ffi_type *t = handle->ffi_arg_types[i];
+
+                // Check if this is a floating-point type
+                bool is_fp = (t->type == FFI_TYPE_FLOAT ||
+                              t->type == FFI_TYPE_DOUBLE ||
+                              t->type == FFI_TYPE_LONGDOUBLE);
+
+                if (is_fp) {
+                    // FP argument - pull from FP registers first, then stack
+                    if (fp_reg_idx < PATCH_FP_REG_ARGS) {
+                        ffi_arg_values[i] = &fp_args[fp_reg_idx];
+                        fp_reg_idx++;
+                    }
+                    else {
+                        // FP arg spilled to stack
+                        ffi_arg_values[i] = &stack[stack_idx];
+                        stack_idx++;
+                    }
+                }
+                else {
+                    // Integer/pointer argument - pull from int registers first, then stack
+                    if (int_reg_idx < PATCH_REG_ARGS) {
+                        ffi_arg_values[i] = &args[int_reg_idx];
+                        int_reg_idx++;
+                    }
+                    else {
+                        // Integer arg spilled to stack
+                        ffi_arg_values[i] = &stack[stack_idx];
+                        stack_idx++;
+                    }
+                }
+            }
+
+            // Handle return value - use appropriate storage based on return type
+            ffi_type *ret_type = handle->ffi_ret_type;
+            bool ret_is_fp = (ret_type->type == FFI_TYPE_FLOAT ||
+                              ret_type->type == FFI_TYPE_DOUBLE ||
+                              ret_type->type == FFI_TYPE_LONGDOUBLE);
+
+            if (ret_is_fp) {
+                // FP return value goes into FP return register
+                ffi_call(handle->ffi_cif, FFI_FN(trampoline), &ctx.fp_return_value, ffi_arg_values);
+                // Also copy to integer return for compatibility
+                result = ctx.fp_return_value.lo;
+            }
+            else {
+                ffi_call(handle->ffi_cif, FFI_FN(trampoline), &result, ffi_arg_values);
+            }
+            ctx.return_value = result;
+        }
+        else
 #endif
-        ctx.return_value = result;
+        {
+            // Default: direct function call (register args only)
+            // Note: FP args are restored by the dispatcher stub before returning
+#ifdef PATCH_ARCH_X86_64
+            typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+            fn_t fn = (fn_t)trampoline;
+            result  = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
+#else
+            typedef uint64_t (*fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
+                                     uint64_t, uint64_t, uint64_t, uint64_t);
+            fn_t fn = (fn_t)trampoline;
+            result  = fn(args[0], args[1], args[2], args[3],
+                         args[4], args[5], args[6], args[7]);
+#endif
+            ctx.return_value = result;
+        }
     }
     else {
         result = ctx.return_value;

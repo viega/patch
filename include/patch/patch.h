@@ -41,6 +41,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef PATCH_HAVE_LIBFFI
+#include <ffi.h>
+#endif
+
 /**
  * @brief Error codes returned by patch functions.
  *
@@ -194,6 +198,19 @@ typedef struct {
 
     /** User data passed to epilogue callback. */
     void *epilogue_user_data;
+
+#ifdef PATCH_HAVE_LIBFFI
+    /**
+     * Optional: FFI type information for full argument forwarding.
+     * When provided, all arguments (including stack args) are forwarded
+     * to the original function when prologue returns true.
+     *
+     * Set to nullptr to use default register-only forwarding.
+     */
+    ffi_type **arg_types; /**< Array of argument types */
+    ffi_type  *return_type; /**< Return type (nullptr = ffi_type_uint64) */
+    size_t     arg_count;   /**< Number of arguments */
+#endif
 } patch_config_t;
 
 /**

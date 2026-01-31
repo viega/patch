@@ -1,0 +1,2 @@
+option('use_libffi', type: 'boolean', value: false,
+       description: 'Require libffi for full argument forwarding')

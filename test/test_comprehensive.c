@@ -77,7 +77,18 @@ PATCH_DEFINE_HOOKABLE(int, func_many_args, int a, int b, int c, int d, int e, in
     return a + b + c + d + e + f + g + h + i;
 }
 
-// Note: Floating point functions removed - dispatcher only saves integer registers
+// Floating point test functions - usable with FFI for proper FP arg forwarding
+// Mixed int and FP arguments
+PATCH_DEFINE_HOOKABLE(double, func_mixed_args, int a, double b, int c, double d)
+{
+    return (double)a + b + (double)c + d;
+}
+
+// Pure FP arguments
+PATCH_DEFINE_HOOKABLE(double, func_fp_only, double a, double b, double c)
+{
+    return a * b + c;
+}
 
 // ============================================================================
 // Hook Functions
@@ -732,6 +743,177 @@ static void test_pointer_return_value(void)
 // dispatcher since it only saves integer registers. This is a known limitation.
 
 // ============================================================================
+// Section 5b: FFI-based Full Argument Forwarding (Optional libffi)
+// ============================================================================
+
+#if defined(PATCH_HAVE_LIBFFI) && !defined(PATCH_PLATFORM_DARWIN)
+
+// Simple passthrough prologue that always calls original
+static bool ffi_passthrough_prologue(patch_context_t *ctx, void *ud)
+{
+    (void)ctx;
+    (void)ud;
+    return true;  // Call original with all args forwarded via FFI
+}
+
+static void test_ffi_stack_arguments(void)
+{
+    printf("Test: FFI stack argument forwarding...\n");
+
+    // Test with func_many_args which has 9 arguments
+    // On x86-64: 6 in registers, 3 on stack
+    // On ARM64: 8 in registers, 1 on stack
+
+    // First verify the function works without hooks
+    int result = PATCH_CALL(func_many_args, 10, 20, 30, 40, 50, 60, 70, 80, 90);
+    assert(result == 450);
+
+    // Set up FFI argument types for 9 int arguments
+    ffi_type *arg_types[] = {
+        &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+        &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+        &ffi_type_sint, &ffi_type_sint, &ffi_type_sint,
+    };
+
+    patch_config_t config = {
+        .target = (void *)func_many_args,
+        .prologue = ffi_passthrough_prologue,
+        .arg_types = arg_types,
+        .arg_count = 9,
+        .return_type = &ffi_type_sint,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook with FFI");
+        return;
+    }
+
+    // Call through the hook - FFI should forward all 9 arguments correctly
+    result = PATCH_CALL(func_many_args, 10, 20, 30, 40, 50, 60, 70, 80, 90);
+
+    if (result != 450) {
+        printf("  Expected: 450, got: %d\n", result);
+        patch_remove(handle);
+        TEST_FAIL("FFI did not forward stack arguments correctly");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_ffi_mixed_fp_arguments(void)
+{
+    printf("Test: FFI mixed int/FP argument forwarding...\n");
+
+    // Test with func_mixed_args(int, double, int, double) -> double
+    // FP and integer args are tracked separately in the ABI
+
+    // First verify the function works without hooks
+    double result = PATCH_CALL(func_mixed_args, 10, 2.5, 20, 3.5);
+    double expected = 10.0 + 2.5 + 20.0 + 3.5;  // = 36.0
+    if (result < expected - 0.001 || result > expected + 0.001) {
+        printf("  Pre-hook result mismatch: expected %f, got %f\n", expected, result);
+        TEST_FAIL("original function didn't work");
+        return;
+    }
+
+    // Set up FFI argument types: int, double, int, double
+    ffi_type *arg_types[] = {
+        &ffi_type_sint,
+        &ffi_type_double,
+        &ffi_type_sint,
+        &ffi_type_double,
+    };
+
+    patch_config_t config = {
+        .target = (void *)func_mixed_args,
+        .prologue = ffi_passthrough_prologue,
+        .arg_types = arg_types,
+        .arg_count = 4,
+        .return_type = &ffi_type_double,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook with FFI");
+        return;
+    }
+
+    // Call through the hook - FFI should forward both int and FP args correctly
+    result = PATCH_CALL(func_mixed_args, 10, 2.5, 20, 3.5);
+
+    if (result < expected - 0.001 || result > expected + 0.001) {
+        printf("  Expected: %f, got: %f\n", expected, result);
+        patch_remove(handle);
+        TEST_FAIL("FFI did not forward mixed arguments correctly");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+static void test_ffi_fp_only_arguments(void)
+{
+    printf("Test: FFI pure FP argument forwarding...\n");
+
+    // Test with func_fp_only(double, double, double) -> double
+
+    // First verify the function works without hooks
+    double result = PATCH_CALL(func_fp_only, 2.0, 3.0, 4.0);
+    double expected = 2.0 * 3.0 + 4.0;  // = 10.0
+    if (result < expected - 0.001 || result > expected + 0.001) {
+        printf("  Pre-hook result mismatch: expected %f, got %f\n", expected, result);
+        TEST_FAIL("original function didn't work");
+        return;
+    }
+
+    // Set up FFI argument types: all doubles
+    ffi_type *arg_types[] = {
+        &ffi_type_double,
+        &ffi_type_double,
+        &ffi_type_double,
+    };
+
+    patch_config_t config = {
+        .target = (void *)func_fp_only,
+        .prologue = ffi_passthrough_prologue,
+        .arg_types = arg_types,
+        .arg_count = 3,
+        .return_type = &ffi_type_double,
+    };
+
+    patch_handle_t *handle = NULL;
+    patch_error_t err = patch_install(&config, &handle);
+    if (err != PATCH_SUCCESS) {
+        printf("  Cannot install hook: %s\n", patch_get_error_details());
+        TEST_SKIP("cannot hook with FFI");
+        return;
+    }
+
+    // Call through the hook - FFI should forward all FP args correctly
+    result = PATCH_CALL(func_fp_only, 2.0, 3.0, 4.0);
+
+    if (result < expected - 0.001 || result > expected + 0.001) {
+        printf("  Expected: %f, got: %f\n", expected, result);
+        patch_remove(handle);
+        TEST_FAIL("FFI did not forward FP arguments correctly");
+        return;
+    }
+
+    patch_remove(handle);
+    TEST_PASS();
+}
+
+#endif // PATCH_HAVE_LIBFFI && !PATCH_PLATFORM_DARWIN
+
+// ============================================================================
 // Section 6: Error Message Tests
 // ============================================================================
 
@@ -869,6 +1051,14 @@ int main(void)
 #endif
     test_64bit_return_value();
     test_pointer_return_value();
+
+    // Section 5b: FFI argument forwarding
+#if defined(PATCH_HAVE_LIBFFI) && !defined(PATCH_PLATFORM_DARWIN)
+    printf("\n--- Section 5b: FFI Argument Forwarding ---\n\n");
+    test_ffi_stack_arguments();
+    test_ffi_mixed_fp_arguments();
+    test_ffi_fp_only_arguments();
+#endif
 
     // Section 6: Error Messages
     printf("\n--- Section 6: Error Handling ---\n\n");

@@ -15,6 +15,7 @@ foreach example : examples
         example + '.c',
         include_directories: include_directories('../include'),
         link_with: patch_lib,
+        dependencies: test_deps,
         build_by_default: false,
     )
 endforeach

@@ -144,6 +144,43 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     h->patch_size         = match.prologue_size;
     atomic_store(&h->enabled, true);
 
+#ifdef PATCH_HAVE_LIBFFI
+    h->ffi_cif       = nullptr;
+    h->ffi_arg_types = nullptr;
+    h->ffi_ret_type  = nullptr;
+    h->ffi_arg_count = 0;
+
+    if (config->arg_types != nullptr && config->arg_count > 0) {
+        h->ffi_arg_count = config->arg_count;
+        h->ffi_arg_types = calloc(config->arg_count, sizeof(ffi_type *));
+        if (h->ffi_arg_types == nullptr) {
+            patch__set_error("Failed to allocate FFI argument types");
+            free(h);
+            return PATCH_ERR_ALLOCATION_FAILED;
+        }
+        memcpy(h->ffi_arg_types, config->arg_types, config->arg_count * sizeof(ffi_type *));
+
+        h->ffi_ret_type = config->return_type ? config->return_type : &ffi_type_uint64;
+
+        h->ffi_cif = malloc(sizeof(ffi_cif));
+        if (h->ffi_cif == nullptr) {
+            patch__set_error("Failed to allocate FFI CIF");
+            free(h->ffi_arg_types);
+            free(h);
+            return PATCH_ERR_ALLOCATION_FAILED;
+        }
+
+        if (ffi_prep_cif(h->ffi_cif, FFI_DEFAULT_ABI, (unsigned int)h->ffi_arg_count,
+                         h->ffi_ret_type, h->ffi_arg_types) != FFI_OK) {
+            patch__set_error("Failed to prepare FFI call interface");
+            free(h->ffi_cif);
+            free(h->ffi_arg_types);
+            free(h);
+            return PATCH_ERR_INTERNAL;
+        }
+    }
+#endif
+
     // Save original bytes
     memcpy(h->original_bytes, config->target, match.prologue_size);
 
@@ -222,6 +259,15 @@ patch_remove(patch_handle_t *handle)
         patch__dispatcher_destroy(handle->dispatcher);
     }
     patch__trampoline_destroy(handle->trampoline);
+
+#ifdef PATCH_HAVE_LIBFFI
+    if (handle->ffi_cif != nullptr) {
+        free(handle->ffi_cif);
+    }
+    if (handle->ffi_arg_types != nullptr) {
+        free(handle->ffi_arg_types);
+    }
+#endif
 
     // Free handle
     free(handle);
