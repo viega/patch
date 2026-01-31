@@ -184,10 +184,10 @@
  * }
  * @endcode
  */
-#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                   \
-    ret name##_impl(__VA_ARGS__);                               \
-    ret (*name##_ptr)(__VA_ARGS__)               = name##_impl; \
-    static ret (*name##__saved_ptr)(__VA_ARGS__) = nullptr;     \
+#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                                       \
+    ret name##_impl(__VA_ARGS__);                                                   \
+    ret (*name##_ptr)(__VA_ARGS__)                                   = name##_impl; \
+    __attribute__((unused)) static ret (*name##__saved_ptr)(__VA_ARGS__) = nullptr; \
     ret name##_impl(__VA_ARGS__)
 
 /**
@@ -368,12 +368,12 @@
  * @param name Function name (without quotes).
  * @param ...  Parameter list (types and names).
  */
-#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                                               \
-    PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__);                        \
-    ret (*name##_ptr)(__VA_ARGS__)                                     = name;              \
-    static ret (*name##__saved_ptr)(__VA_ARGS__)                       = nullptr;           \
-    static patch_handle_t                        *name##__patch_handle = nullptr;           \
-    static int                                    name##__hook_method  = PATCH_METHOD_AUTO; \
+#define PATCH_DEFINE_HOOKABLE(ret, name, ...)                                                          \
+    PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__);                                   \
+    ret (*name##_ptr)(__VA_ARGS__)                                                    = name;          \
+    __attribute__((unused)) static ret (*name##__saved_ptr)(__VA_ARGS__)              = nullptr;       \
+    __attribute__((unused)) static patch_handle_t *name##__patch_handle               = nullptr;       \
+    __attribute__((unused)) static int             name##__hook_method = PATCH_METHOD_AUTO;            \
     PATCH_PATCHABLE __attribute__((noinline)) ret name(__VA_ARGS__)
 
 /**
@@ -389,9 +389,16 @@
  * @brief Get the original (unhooked) function.
  *
  * @param name Function name.
- * @return The original function.
+ * @return The original function (or trampoline if code patching is active).
+ *
+ * @note When PATCH_METHOD_CODE is in use, this returns the trampoline which
+ *       executes the original function code. When using pointer indirection,
+ *       this returns the function directly.
  */
-#define PATCH_HOOK_ORIGINAL(name) name
+#define PATCH_HOOK_ORIGINAL(name) \
+    ((typeof(&name))(name##__patch_handle != nullptr \
+        ? patch_get_trampoline(name##__patch_handle) \
+        : (void *)name))
 
 // Internal: 2-argument version (uses default method)
 #define PATCH__HOOK_INSTALL2(name, hook)             \

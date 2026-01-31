@@ -335,6 +335,46 @@ patch_error_t patch_enable(patch_handle_t *handle);
 bool patch_context_set_arg(patch_context_t *ctx, size_t index, const void *value, size_t size);
 
 /**
+ * @brief Get a floating-point argument by index.
+ *
+ * Returns a pointer to the storage location of the specified FP argument.
+ * The pointer can be cast to float* or double* and dereferenced.
+ *
+ * @param ctx   Context passed to the callback.
+ * @param index Zero-based FP argument index (0-7 on both architectures).
+ *
+ * @return Pointer to 128-bit FP argument storage, or nullptr if out of range.
+ *
+ * @code
+ * bool my_prologue(patch_context_t *ctx, void *user_data) {
+ *     double *first_fp = (double *)patch_context_get_fp_arg(ctx, 0);
+ *     printf("First FP argument: %f\n", *first_fp);
+ *     return true;
+ * }
+ * @endcode
+ *
+ * @note FP arguments use separate registers from integer arguments.
+ *       A function like `void foo(int a, double b)` has `a` in integer
+ *       arg 0 and `b` in FP arg 0.
+ */
+[[nodiscard]] void *patch_context_get_fp_arg(patch_context_t *ctx, size_t index);
+
+/**
+ * @brief Modify a floating-point argument.
+ *
+ * Changes the value of the specified FP argument before the original
+ * function sees it. Only valid in prologue callbacks.
+ *
+ * @param ctx   Context passed to the callback.
+ * @param index Zero-based FP argument index.
+ * @param value Pointer to the new value (float, double, or 128-bit vector).
+ * @param size  Size of the value in bytes (4, 8, or 16).
+ *
+ * @return true on success, false if index is out of range.
+ */
+bool patch_context_set_fp_arg(patch_context_t *ctx, size_t index, const void *value, size_t size);
+
+/**
  * @brief Get the function's return value.
  *
  * Returns a pointer to the return value storage. Only valid in epilogue

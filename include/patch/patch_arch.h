@@ -115,6 +115,13 @@
  * Arguments are passed in: RDI, RSI, RDX, RCX, R8, R9.
  */
 #define PATCH_REG_ARGS 6
+
+/**
+ * @brief Number of floating-point register arguments.
+ *
+ * Arguments are passed in: XMM0-XMM7.
+ */
+#define PATCH_FP_REG_ARGS 8
 #endif
 
 #ifdef PATCH_ARCH_ARM64
@@ -151,4 +158,11 @@
  * Arguments are passed in: X0-X7.
  */
 #define PATCH_REG_ARGS 8
+
+/**
+ * @brief Number of floating-point register arguments.
+ *
+ * Arguments are passed in: V0-V7 (SIMD/FP registers).
+ */
+#define PATCH_FP_REG_ARGS 8
 #endif

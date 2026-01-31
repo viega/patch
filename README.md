@@ -1,132 +1,195 @@
 # patch - Runtime Function Hooking Library
 
-A C23 library for runtime function hooking on x86-64 and ARM64, supporting ELF (Linux) and Mach-O (macOS).
+A C23 library for runtime function hooking on x86-64 and ARM64, supporting Linux and macOS.
 
 ## Features
 
-- **Prologue detours**: Hook function entry points with argument inspection
-- **Epilogue detours**: Hook function returns with return value modification (planned)
+- **Simple replacement**: Direct function replacement with trampoline access
+- **Prologue/epilogue callbacks**: Advanced hooks with argument and return value inspection
+- **Unified macro interface**: Portable hooking that works across platforms
 - **Pattern recognition**: Automatic detection of compiler-generated prologues
 - **Patchable function entry**: Full support for `__attribute__((patchable_function_entry))`
-- **Cross-platform**: Linux and macOS support
-- **Cross-architecture**: x86-64 and ARM64
 
-## Platform Notes
+## Quick Start
 
-### Linux
-Full support for runtime patching. Functions can be hooked regardless of how they were compiled, as long as the prologue pattern is recognized.
+### Using the Macro Interface (Recommended)
 
-### macOS
-Due to hardware W^X (write XOR execute) enforcement on Apple Silicon and code signing requirements, **runtime patching of arbitrary code is not supported**.
-
-**Recommended approach on macOS:**
-1. Use `__attribute__((patchable_function_entry(N)))` on functions you want to hook
-2. This inserts NOP instructions that can be safely overwritten
-3. Even with this, you need appropriate entitlements for hardened runtime
-
-For dynamic libraries, consider using interposition or DYLD_INSERT_LIBRARIES instead.
-
-## Building
-
-Requires Clang 22+ with C23 support:
-
-```bash
-CC=/usr/local/bin/clang meson setup build
-meson compile -C build
-meson test -C build
-```
-
-## Usage
-
-### Making Functions Patchable
-
-For reliable hooking, mark target functions with the patchable attribute:
+The easiest way to use the library is through the unified macro interface:
 
 ```c
-#define PATCHABLE __attribute__((patchable_function_entry(8, 4)))
+#include "patch/patch_hook.h"
 
-PATCHABLE int my_function(int x) {
-    return x * 2;
+// 1. Define a hookable function
+PATCH_DEFINE_HOOKABLE(int, add, int a, int b) {
+    return a + b;
 }
-```
 
-This inserts 8 NOP instructions (4 before entry, 4 at entry), providing safe space for the hook.
-
-### Installing a Hook
-
-```c
-#include <patch/patch.h>
-
-bool my_prologue(patch_context_t *ctx, void *user_data) {
-    // Called before original function runs
-    // Return true to proceed, false to skip original
-    return true;
+// 2. Write a hook with the same signature
+int my_hook(int a, int b) {
+    printf("add(%d, %d) called\n", a, b);
+    return PATCH_CALL_ORIGINAL(add, a, b) + 100;
 }
 
 int main(void) {
-    // Check if function can be hooked
-    if (patch_can_install((void *)my_function) != PATCH_SUCCESS) {
-        fprintf(stderr, "Cannot hook: %s\n", patch_get_error_details());
+    // 3. Call the function normally
+    int result = PATCH_CALL(add, 2, 3);  // returns 5
+
+    // 4. Install the hook
+    PATCH_HOOK_INSTALL(add, my_hook);
+
+    // 5. Calls now go through the hook
+    result = PATCH_CALL(add, 2, 3);  // prints "add(2, 3) called", returns 105
+
+    // 6. Remove when done
+    PATCH_HOOK_REMOVE(add);
+
+    return 0;
+}
+```
+
+### Hook Methods (Linux)
+
+On Linux, you can choose between pointer indirection and code patching:
+
+```c
+// Pointer indirection (default, like macOS)
+PATCH_HOOK_INSTALL(add, my_hook, PATCH_METHOD_POINTER);
+
+// Code patching via NOP sled (more powerful)
+PATCH_HOOK_INSTALL(add, my_hook, PATCH_METHOD_CODE);
+```
+
+## Low-Level API
+
+For more control, use the low-level API directly.
+
+### Simple Replacement Mode
+
+Replace a function directly, with access to the original via trampoline:
+
+```c
+#include "patch/patch.h"
+
+static patch_handle_t *g_handle = NULL;
+
+int my_replacement(int a, int b) {
+    // Get the original function via trampoline
+    typedef int (*orig_fn)(int, int);
+    orig_fn original = (orig_fn)patch_get_trampoline(g_handle);
+
+    // Call original and modify result
+    return original(a, b) + 100;
+}
+
+int main(void) {
+    patch_config_t config = {
+        .target = (void *)add,
+        .replacement = (void *)my_replacement,
+    };
+
+    patch_error_t err = patch_install(&config, &g_handle);
+    if (err != PATCH_SUCCESS) {
+        fprintf(stderr, "Failed: %s\n", patch_get_error_details());
         return 1;
     }
 
-    // Install hook
+    add(2, 3);  // Calls my_replacement, which calls original
+
+    patch_remove(g_handle);
+    return 0;
+}
+```
+
+### Callback Mode
+
+For argument inspection and modification, use prologue/epilogue callbacks:
+
+```c
+bool my_prologue(patch_context_t *ctx, void *user_data) {
+    // Inspect arguments
+    int *arg0 = (int *)patch_context_get_arg(ctx, 0);
+    printf("First argument: %d\n", *arg0);
+
+    // Modify arguments
+    int new_value = *arg0 * 2;
+    patch_context_set_arg(ctx, 0, &new_value, sizeof(new_value));
+
+    // Return true to call original, false to skip it
+    return true;
+}
+
+void my_epilogue(patch_context_t *ctx, void *user_data) {
+    // Inspect return value
+    int *result = (int *)patch_context_get_return(ctx);
+    printf("Returned: %d\n", *result);
+
+    // Modify return value
+    int new_result = *result + 1000;
+    patch_context_set_return(ctx, &new_result, sizeof(new_result));
+}
+
+int main(void) {
     patch_config_t config = {
         .target = (void *)my_function,
         .prologue = my_prologue,
+        .epilogue = my_epilogue,
+        .prologue_user_data = NULL,
+        .epilogue_user_data = NULL,
     };
 
     patch_handle_t *handle;
-    patch_error_t err = patch_install(&config, &handle);
-    if (err != PATCH_SUCCESS) {
-        fprintf(stderr, "Install failed: %s\n", patch_get_error_details());
-        return 1;
-    }
+    patch_install(&config, &handle);
 
-    // Call hooked function
-    my_function(42);
+    my_function(42);  // Callbacks are invoked
 
-    // Remove hook when done
     patch_remove(handle);
     return 0;
 }
 ```
 
-### Calling Original Function
+## Platform Notes
 
-From within a hook callback, get the trampoline to call the original:
+### Linux
 
-```c
-bool my_prologue(patch_context_t *ctx, void *user_data) {
-    // Get original function
-    int (*original)(int) = patch_context_get_original(ctx);
+Full support for runtime patching via code modification. Both pointer indirection and code patching are available.
 
-    // Call it
-    int result = original(42);
+### macOS
 
-    return true;  // Still run the normal path
-}
+Due to hardware W^X (write XOR execute) enforcement on Apple Silicon, **runtime code modification is not supported**. The library automatically uses pointer indirection via the unified macro interface.
+
+For hooking:
+1. Use `PATCH_DEFINE_HOOKABLE` to create hookable functions
+2. Use `PATCH_HOOK_INSTALL/REMOVE` for hook management
+3. Calls must go through `PATCH_CALL()` for hooks to work
+
+## Building
+
+Requires Clang 18+ with C23 support:
+
+```bash
+# macOS
+CC=/usr/local/bin/clang meson setup build
+meson compile -C build
+meson test -C build
+
+# Linux (Docker)
+./scripts/test-docker.sh
 ```
 
 ## API Reference
 
-### Error Codes
+### Unified Macro Interface
 
-```c
-typedef enum {
-    PATCH_SUCCESS = 0,
-    PATCH_ERR_PATTERN_UNRECOGNIZED,   // Prologue not matched
-    PATCH_ERR_EPILOGUE_UNRECOGNIZED,  // Epilogue not matched
-    PATCH_ERR_INSUFFICIENT_SPACE,     // Not enough bytes for patch
-    PATCH_ERR_MEMORY_PROTECTION,      // mprotect/vm_protect failed
-    PATCH_ERR_ALLOCATION_FAILED,
-    PATCH_ERR_ALREADY_PATCHED,
-    PATCH_ERR_NOT_PATCHED,
-    PATCH_ERR_UNSUPPORTED_ARCH,
-    PATCH_ERR_INVALID_ARGUMENT,
-    PATCH_ERR_INTERNAL,
-} patch_error_t;
-```
+| Macro | Description |
+|-------|-------------|
+| `PATCH_DEFINE_HOOKABLE(ret, name, ...)` | Define a hookable function |
+| `PATCH_DECLARE_HOOKABLE(ret, name, ...)` | Declare (for headers) |
+| `PATCH_CALL(name, ...)` | Call a hookable function |
+| `PATCH_CALL_ORIGINAL(name, ...)` | Call original from within hook |
+| `PATCH_HOOK_ORIGINAL(name)` | Get original function pointer |
+| `PATCH_HOOK_INSTALL(name, hook [, method])` | Install a hook |
+| `PATCH_HOOK_REMOVE(name)` | Remove a hook |
+| `PATCH_HOOK_IS_INSTALLED(name)` | Check if hooked |
 
 ### Core Functions
 
@@ -137,7 +200,25 @@ typedef enum {
 | `patch_remove(handle)` | Remove hook and free resources |
 | `patch_disable(handle)` | Temporarily disable hook |
 | `patch_enable(handle)` | Re-enable disabled hook |
+| `patch_get_trampoline(handle)` | Get callable original function |
 | `patch_get_error_details()` | Get human-readable error message |
+
+### Configuration Structure
+
+```c
+typedef struct {
+    void *target;              // Function to hook
+
+    // Simple replacement mode (mutually exclusive with callbacks)
+    void *replacement;         // Direct replacement function
+
+    // Callback mode (mutually exclusive with replacement)
+    patch_prologue_fn prologue;     // Called before original
+    patch_epilogue_fn epilogue;     // Called after original
+    void *prologue_user_data;
+    void *epilogue_user_data;
+} patch_config_t;
+```
 
 ### Context Functions (for callbacks)
 
@@ -149,34 +230,69 @@ typedef enum {
 | `patch_context_set_return(ctx, value, size)` | Set return value |
 | `patch_context_get_original(ctx)` | Get trampoline to original |
 
-## Recognized Patterns
+### Error Codes
+
+| Code | Description |
+|------|-------------|
+| `PATCH_SUCCESS` | Operation succeeded |
+| `PATCH_ERR_PATTERN_UNRECOGNIZED` | Prologue not recognized |
+| `PATCH_ERR_INSUFFICIENT_SPACE` | Prologue too small |
+| `PATCH_ERR_MEMORY_PROTECTION` | Cannot modify memory |
+| `PATCH_ERR_ALLOCATION_FAILED` | Out of memory |
+| `PATCH_ERR_INVALID_ARGUMENT` | NULL or invalid parameter |
+| `PATCH_ERR_INTERNAL` | Library bug |
+
+## Recognized Prologue Patterns
 
 ### x86-64
 
-- **Frame setup**: `push rbp; mov rbp, rsp; [sub rsp, N]`
-- **ENDBR64**: CET-enabled prologues
-- **No-frame**: Optimized code with callee-saved pushes
-- **Patchable entry**: NOP sleds from `patchable_function_entry`
+| Pattern | Description |
+|---------|-------------|
+| Patchable entry | NOP sled from `patchable_function_entry` |
+| ENDBR64 | CET-enabled functions |
+| Frame setup | `push rbp; mov rbp, rsp` |
+| No-frame | Optimized with callee-saved pushes |
+| Sub RSP | Leaf functions with stack allocation |
 
 ### ARM64
 
-- **Frame setup**: `stp x29, x30, [sp, #-N]!; mov x29, sp`
-- **PAC**: Pointer-authenticated prologues (`paciasp`/`pacibsp`)
-- **BTI**: Branch target identification prologues
-- **Leaf**: Functions starting with `sub sp, sp, #N`
-- **Patchable entry**: NOP sleds from `patchable_function_entry`
+| Pattern | Description |
+|---------|-------------|
+| Patchable entry | NOP sled (2+ NOPs) |
+| BTI | Branch target identification |
+| PAC | Pointer authentication (`paciasp`) |
+| Frame setup | `stp x29, x30, [sp, #-N]!` |
+| Leaf | `sub sp, sp, #N` |
 
 ## Architecture
 
 ```
 patch/
-├── include/patch/       # Public headers
+├── include/patch/
+│   ├── patch.h           # Low-level API
+│   ├── patch_arch.h      # Architecture detection
+│   └── patch_hook.h      # Unified macro interface
 ├── src/
-│   ├── arch/           # x86_64.c, arm64.c
-│   ├── platform/       # darwin.c, linux.c
-│   └── pattern/        # Prologue pattern matchers
+│   ├── patch.c           # Core implementation
+│   ├── trampoline.c      # Original function relocation
+│   ├── dispatcher.c      # Callback dispatch stubs
+│   ├── arch/             # x86_64.c, arm64.c
+│   ├── platform/         # darwin.c, linux.c
+│   └── pattern/          # Pattern registration
 └── test/
+    ├── test_basic.c
+    ├── test_hooks.c
+    ├── test_realworld.c
+    ├── test_comprehensive.c
+    └── TESTING.md
 ```
+
+## Limitations
+
+- **Floating-point arguments**: Currently only integer registers are saved in callbacks
+- **Stack arguments**: Only register arguments are accessible (6 on x86-64, 8 on ARM64)
+- **Thread safety**: Install/remove are not thread-safe during concurrent execution
+- **macOS code patching**: Not available due to hardware restrictions
 
 ## License
 

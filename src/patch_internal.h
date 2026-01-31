@@ -28,7 +28,8 @@ typedef struct {
 struct patch_handle {
     void                *target;
     patch__trampoline_t *trampoline;
-    void                *dispatcher;   // Generated stub that invokes callbacks
+    void                *dispatcher;   // Generated stub that invokes callbacks (may be NULL)
+    void                *detour_dest;  // Where the detour jumps to (dispatcher or replacement)
     uint8_t              original_bytes[PATCH_MAX_PATCH_SIZE];
     size_t               patch_size;
     patch_prologue_fn    prologue;
@@ -39,12 +40,20 @@ struct patch_handle {
     mem_prot_t           original_prot;
 };
 
+// 128-bit type for FP/SIMD registers (XMM on x86-64, V on ARM64)
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} patch__fp_reg_t;
+
 // Context passed to callbacks
 struct patch_context {
-    patch_handle_t *handle;
-    uint64_t        args[PATCH_REG_ARGS];
-    uint64_t        return_value;
-    bool            return_set;
+    patch_handle_t  *handle;
+    uint64_t         args[PATCH_REG_ARGS];        // Integer arguments
+    patch__fp_reg_t  fp_args[PATCH_FP_REG_ARGS];  // Floating-point arguments
+    uint64_t         return_value;                 // Integer return value
+    patch__fp_reg_t  fp_return_value;             // FP return value (xmm0/v0)
+    bool             return_set;
 };
 
 // Trampoline management
@@ -60,7 +69,11 @@ patch_error_t patch__dispatcher_create(patch_handle_t *handle, void **out);
 void          patch__dispatcher_destroy(void *dispatcher);
 
 // Dispatch function called by generated dispatcher stub
-uint64_t patch__dispatch_full(patch_handle_t *handle, uint64_t *args, void *trampoline);
+// fp_args points to saved FP registers (8 x 128-bit)
+uint64_t patch__dispatch_full(patch_handle_t  *handle,
+                              uint64_t        *args,
+                              patch__fp_reg_t *fp_args,
+                              void            *trampoline);
 
 // Write the detour jump at target
 patch_error_t patch__write_detour(void *target, void *destination, size_t available_size);

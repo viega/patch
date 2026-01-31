@@ -184,6 +184,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         }
         detour_dest = h->dispatcher;
     }
+    h->detour_dest = detour_dest;
 
     // Write the detour at the original function
     err = patch__write_detour(config->target, detour_dest, match.prologue_size);
@@ -268,9 +269,9 @@ patch_enable(patch_handle_t *handle)
         return PATCH_SUCCESS;
     }
 
-    // Re-write the detour (points to dispatcher)
+    // Re-write the detour (points to dispatcher or replacement function)
     patch_error_t err = patch__write_detour(handle->target,
-                                            handle->dispatcher,
+                                            handle->detour_dest,
                                             handle->patch_size);
     if (err != PATCH_SUCCESS) {
         return err;
@@ -301,6 +302,28 @@ patch_context_set_arg(patch_context_t *ctx, size_t index, const void *value, siz
         size = sizeof(ctx->args[0]);
     }
     memcpy(&ctx->args[index], value, size);
+    return true;
+}
+
+void *
+patch_context_get_fp_arg(patch_context_t *ctx, size_t index)
+{
+    if (ctx == nullptr || index >= PATCH_FP_REG_ARGS) {
+        return nullptr;
+    }
+    return &ctx->fp_args[index];
+}
+
+bool
+patch_context_set_fp_arg(patch_context_t *ctx, size_t index, const void *value, size_t size)
+{
+    if (ctx == nullptr || index >= PATCH_FP_REG_ARGS || value == nullptr) {
+        return false;
+    }
+    if (size > sizeof(ctx->fp_args[0])) {
+        size = sizeof(ctx->fp_args[0]);
+    }
+    memcpy(&ctx->fp_args[index], value, size);
     return true;
 }
 

@@ -81,6 +81,16 @@ test_realworld = executable('test_realworld',
     dependencies: [cc.find_library('dl', required: false)],
 )
 
+test_comprehensive = executable('test_comprehensive',
+    'test/test_comprehensive.c',
+    include_directories: inc,
+    link_with: patch_lib,
+)
+
 test('basic', test_basic)
 test('hooks', test_hooks)
 test('realworld', test_realworld)
+test('comprehensive', test_comprehensive)
+
+# Examples (optional, not built by default)
+subdir('examples')
