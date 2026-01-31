@@ -1,10 +1,10 @@
 #include "patch_internal.h"
 
 #include "arch/arch.h"
+#include "futex.h"
 #include "pattern/pattern.h"
 #include "platform/platform.h"
 
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,10 +18,10 @@ static _Thread_local char g_error_buffer[PATCH_ERROR_BUFFER_SIZE];
 // a thread executing in a hook while another thread removes it. For that level
 // of safety, users should ensure no threads are calling the hooked function
 // during removal, or use appropriate synchronization in their code.
-static pthread_mutex_t g_patch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static futex_mutex_t g_patch_mutex = FUTEX_MUTEX_INIT;
 
 // One-time initialization
-static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+static futex_once_t g_init_once = FUTEX_ONCE_INIT;
 
 void
 patch__set_error(const char *fmt, ...)
@@ -60,7 +60,7 @@ do_initialize(void)
 static void
 ensure_initialized(void)
 {
-    pthread_once(&g_init_once, do_initialize);
+    futex_once(&g_init_once, do_initialize);
 }
 
 patch_error_t
@@ -135,7 +135,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     }
 
     // Acquire lock for thread-safe installation
-    pthread_mutex_lock(&g_patch_mutex);
+    futex_mutex_lock(&g_patch_mutex);
 
     // Match prologue pattern
     pattern_match_t match = pattern_match_prologue(
@@ -144,7 +144,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
 
     if (!match.matched) {
         patch__set_error("No recognized prologue pattern at target");
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return PATCH_ERR_PATTERN_UNRECOGNIZED;
     }
 
@@ -152,7 +152,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     patch_handle_t *h = calloc(1, sizeof(*h));
     if (h == nullptr) {
         patch__set_error("Failed to allocate handle");
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return PATCH_ERR_ALLOCATION_FAILED;
     }
 
@@ -176,7 +176,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         if (h->ffi_arg_types == nullptr) {
             patch__set_error("Failed to allocate FFI argument types");
             free(h);
-            pthread_mutex_unlock(&g_patch_mutex);
+            futex_mutex_unlock(&g_patch_mutex);
             return PATCH_ERR_ALLOCATION_FAILED;
         }
         memcpy(h->ffi_arg_types, config->arg_types, config->arg_count * sizeof(ffi_type *));
@@ -188,7 +188,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
             patch__set_error("Failed to allocate FFI CIF");
             free(h->ffi_arg_types);
             free(h);
-            pthread_mutex_unlock(&g_patch_mutex);
+            futex_mutex_unlock(&g_patch_mutex);
             return PATCH_ERR_ALLOCATION_FAILED;
         }
 
@@ -198,7 +198,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
             free(h->ffi_cif);
             free(h->ffi_arg_types);
             free(h);
-            pthread_mutex_unlock(&g_patch_mutex);
+            futex_mutex_unlock(&g_patch_mutex);
             return PATCH_ERR_INTERNAL;
         }
     }
@@ -211,7 +211,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
     patch_error_t err = platform_get_protection(config->target, &h->original_prot);
     if (err != PATCH_SUCCESS) {
         free(h);
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
@@ -224,7 +224,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
                                    &h->trampoline);
     if (err != PATCH_SUCCESS) {
         free(h);
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
@@ -242,7 +242,7 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         if (err != PATCH_SUCCESS) {
             patch__trampoline_destroy(h->trampoline);
             free(h);
-            pthread_mutex_unlock(&g_patch_mutex);
+            futex_mutex_unlock(&g_patch_mutex);
             return err;
         }
         detour_dest = h->dispatcher;
@@ -257,12 +257,12 @@ patch_install(const patch_config_t *config, patch_handle_t **handle)
         }
         patch__trampoline_destroy(h->trampoline);
         free(h);
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
     *handle = h;
-    pthread_mutex_unlock(&g_patch_mutex);
+    futex_mutex_unlock(&g_patch_mutex);
     return PATCH_SUCCESS;
 }
 
@@ -274,14 +274,14 @@ patch_remove(patch_handle_t *handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    pthread_mutex_lock(&g_patch_mutex);
+    futex_mutex_lock(&g_patch_mutex);
 
     // Restore original bytes
     patch_error_t err = patch__restore_bytes(handle->target,
                                              handle->original_bytes,
                                              handle->patch_size);
     if (err != PATCH_SUCCESS) {
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
@@ -303,7 +303,7 @@ patch_remove(patch_handle_t *handle)
     // Free handle
     free(handle);
 
-    pthread_mutex_unlock(&g_patch_mutex);
+    futex_mutex_unlock(&g_patch_mutex);
     return PATCH_SUCCESS;
 }
 
@@ -315,12 +315,12 @@ patch_disable(patch_handle_t *handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    pthread_mutex_lock(&g_patch_mutex);
+    futex_mutex_lock(&g_patch_mutex);
 
     // Idempotent: calling disable on an already-disabled patch succeeds silently.
     // This simplifies caller logic and matches common expectations.
     if (!atomic_load(&handle->enabled)) {
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return PATCH_SUCCESS;
     }
 
@@ -329,12 +329,12 @@ patch_disable(patch_handle_t *handle)
                                              handle->original_bytes,
                                              handle->patch_size);
     if (err != PATCH_SUCCESS) {
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
     atomic_store(&handle->enabled, false);
-    pthread_mutex_unlock(&g_patch_mutex);
+    futex_mutex_unlock(&g_patch_mutex);
     return PATCH_SUCCESS;
 }
 
@@ -346,12 +346,12 @@ patch_enable(patch_handle_t *handle)
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    pthread_mutex_lock(&g_patch_mutex);
+    futex_mutex_lock(&g_patch_mutex);
 
     // Idempotent: calling enable on an already-enabled patch succeeds silently.
     // This simplifies caller logic and matches common expectations.
     if (atomic_load(&handle->enabled)) {
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return PATCH_SUCCESS;
     }
 
@@ -360,12 +360,12 @@ patch_enable(patch_handle_t *handle)
                                             handle->detour_dest,
                                             handle->patch_size);
     if (err != PATCH_SUCCESS) {
-        pthread_mutex_unlock(&g_patch_mutex);
+        futex_mutex_unlock(&g_patch_mutex);
         return err;
     }
 
     atomic_store(&handle->enabled, true);
-    pthread_mutex_unlock(&g_patch_mutex);
+    futex_mutex_unlock(&g_patch_mutex);
     return PATCH_SUCCESS;
 }
 
