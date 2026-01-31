@@ -178,6 +178,10 @@ patch__get_chain_next(patch_handle_t *handle)
     if (handle->chain_next != nullptr && handle->chain_next->dispatcher != nullptr) {
         return handle->chain_next->dispatcher;
     }
+    // For GOT hooks with callbacks, return the original function address
+    if (handle->is_got_hook) {
+        return handle->original_got_value;
+    }
     // Otherwise return the trampoline (original function)
     return handle->trampoline->code;
 }
@@ -507,6 +511,22 @@ patch_remove(patch_handle_t *handle)
         if (handle->got_entry != nullptr) {
             *handle->got_entry = handle->original_got_value;
         }
+        // Free dispatcher if using callback mode
+        if (handle->dispatcher != nullptr) {
+            patch__dispatcher_destroy(handle->dispatcher);
+        }
+        // Free passthrough trampoline if using callback mode
+        if (handle->trampoline != nullptr) {
+            patch__trampoline_destroy(handle->trampoline);
+        }
+#ifdef PATCH_HAVE_LIBFFI
+        if (handle->ffi_cif != nullptr) {
+            free(handle->ffi_cif);
+        }
+        if (handle->ffi_arg_types != nullptr) {
+            free(handle->ffi_arg_types);
+        }
+#endif
         free(handle);
         futex_mutex_unlock(&g_patch_mutex);
         return PATCH_SUCCESS;
@@ -917,9 +937,10 @@ patch_resolve_symbol(const char *symbol, const char *library, void **address)
     return PATCH_SUCCESS;
 }
 
-// Internal: Install a GOT hook (simple pointer replacement)
+// Internal: Install a GOT hook
+// Supports both simple replacement (replacement != NULL) and callback mode (prologue/epilogue != NULL)
 static patch_error_t
-patch_install_got(void **got_entry, void *replacement, void *original, patch_handle_t **out)
+patch_install_got(void **got_entry, void *original, const patch_config_t *config, patch_handle_t **out)
 {
     // Allocate handle
     patch_handle_t *h = calloc(1, sizeof(patch_handle_t));
@@ -932,8 +953,96 @@ patch_install_got(void **got_entry, void *replacement, void *original, patch_han
     h->got_entry          = got_entry;
     h->original_got_value = original;
     h->target             = original;  // Target is the original function
-    h->detour_dest        = replacement;
+    h->prologue           = config->prologue;
+    h->epilogue           = config->epilogue;
+    h->prologue_user_data = config->prologue_user_data;
+    h->epilogue_user_data = config->epilogue_user_data;
     atomic_store(&h->enabled, true);
+
+#ifdef PATCH_HAVE_LIBFFI
+    h->ffi_cif       = nullptr;
+    h->ffi_arg_types = nullptr;
+    h->ffi_ret_type  = nullptr;
+    h->ffi_arg_count = 0;
+
+    if (config->arg_types != nullptr && config->arg_count > 0) {
+        h->ffi_arg_count = config->arg_count;
+        h->ffi_arg_types = calloc(config->arg_count, sizeof(ffi_type *));
+        if (h->ffi_arg_types == nullptr) {
+            patch__set_error("Failed to allocate FFI argument types");
+            free(h);
+            return PATCH_ERR_ALLOCATION_FAILED;
+        }
+        memcpy(h->ffi_arg_types, config->arg_types, config->arg_count * sizeof(ffi_type *));
+
+        h->ffi_ret_type = config->return_type ? config->return_type : &ffi_type_uint64;
+
+        h->ffi_cif = malloc(sizeof(ffi_cif));
+        if (h->ffi_cif == nullptr) {
+            patch__set_error("Failed to allocate FFI CIF");
+            free(h->ffi_arg_types);
+            free(h);
+            return PATCH_ERR_ALLOCATION_FAILED;
+        }
+
+        if (ffi_prep_cif(h->ffi_cif, FFI_DEFAULT_ABI, (unsigned int)h->ffi_arg_count,
+                         h->ffi_ret_type, h->ffi_arg_types) != FFI_OK) {
+            patch__set_error("Failed to prepare FFI call interface");
+            free(h->ffi_cif);
+            free(h->ffi_arg_types);
+            free(h);
+            return PATCH_ERR_INTERNAL;
+        }
+    }
+#endif
+
+    // Determine if using callback mode or simple replacement mode
+    bool has_callbacks = (config->prologue != nullptr || config->epilogue != nullptr);
+
+    void         *detour_dest;
+    patch_error_t err;
+
+    if (has_callbacks) {
+        // Callback mode: create a passthrough trampoline and dispatcher
+        err = patch__trampoline_create_passthrough(original, &h->trampoline);
+        if (err != PATCH_SUCCESS) {
+            patch__set_error("failed to create passthrough trampoline for GOT hook");
+#ifdef PATCH_HAVE_LIBFFI
+            if (h->ffi_cif != nullptr) {
+                free(h->ffi_cif);
+            }
+            if (h->ffi_arg_types != nullptr) {
+                free(h->ffi_arg_types);
+            }
+#endif
+            free(h);
+            return err;
+        }
+
+        err = patch__dispatcher_create(h, &h->dispatcher);
+        if (err != PATCH_SUCCESS) {
+            patch__trampoline_destroy(h->trampoline);
+#ifdef PATCH_HAVE_LIBFFI
+            if (h->ffi_cif != nullptr) {
+                free(h->ffi_cif);
+            }
+            if (h->ffi_arg_types != nullptr) {
+                free(h->ffi_arg_types);
+            }
+#endif
+            free(h);
+            return err;
+        }
+        detour_dest = h->dispatcher;
+    }
+    else {
+        // Simple replacement mode
+        detour_dest   = config->replacement;
+        h->trampoline = nullptr;
+        h->dispatcher = nullptr;
+    }
+
+    h->detour_dest = detour_dest;
 
     // GOT is typically in a writable data segment, so we can just write to it
     // But we should ensure it's writable first
@@ -942,6 +1051,20 @@ patch_install_got(void **got_entry, void *replacement, void *original, patch_han
         if (prot != MEM_PROT_RW && prot != MEM_PROT_RWX) {
             // Need to make it writable
             if (platform_protect(got_entry, sizeof(void *), MEM_PROT_RW) != PATCH_SUCCESS) {
+                if (h->dispatcher != nullptr) {
+                    patch__dispatcher_destroy(h->dispatcher);
+                }
+                if (h->trampoline != nullptr) {
+                    patch__trampoline_destroy(h->trampoline);
+                }
+#ifdef PATCH_HAVE_LIBFFI
+                if (h->ffi_cif != nullptr) {
+                    free(h->ffi_cif);
+                }
+                if (h->ffi_arg_types != nullptr) {
+                    free(h->ffi_arg_types);
+                }
+#endif
                 free(h);
                 patch__set_error("failed to make GOT entry writable");
                 return PATCH_ERR_MEMORY_PROTECTION;
@@ -950,7 +1073,7 @@ patch_install_got(void **got_entry, void *replacement, void *original, patch_han
     }
 
     // Write the new value
-    *got_entry = replacement;
+    *got_entry = detour_dest;
 
     *out = h;
     return PATCH_SUCCESS;
@@ -993,25 +1116,13 @@ patch_install_symbol(const char           *symbol,
 
         if (err == PATCH_SUCCESS && got_entry != nullptr) {
             // Found a GOT entry - use GOT hooking
-            void *replacement = config->replacement;
+            // GOT hooking now supports both replacement mode and callback mode
+            bool has_replacement = config->replacement != nullptr;
+            bool has_callbacks   = config->prologue != nullptr || config->epilogue != nullptr;
 
-            // For GOT hooking, we need a replacement function
-            // Callback mode (prologue/epilogue) is not supported with GOT hooking
-            if (replacement == nullptr) {
-                if (config->prologue != nullptr || config->epilogue != nullptr) {
-                    patch__set_error("GOT hooking does not support prologue/epilogue callbacks; "
-                                     "use replacement mode or PATCH_METHOD_CODE");
-                    if (method == PATCH_METHOD_GOT) {
-                        return PATCH_ERR_INVALID_ARGUMENT;
-                    }
-                    // Fall through to code patching for AUTO mode
-                    goto try_code_patching;
-                }
-            }
-
-            if (replacement != nullptr) {
+            if (has_replacement || has_callbacks) {
                 futex_mutex_lock(&g_patch_mutex);
-                err = patch_install_got(got_entry, replacement, target, handle);
+                err = patch_install_got(got_entry, target, config, handle);
                 futex_mutex_unlock(&g_patch_mutex);
                 return err;
             }
@@ -1024,8 +1135,6 @@ patch_install_symbol(const char           *symbol,
         }
         // Fall through to code patching for AUTO mode
     }
-
-try_code_patching:
     // Use code patching (with breakpoint fallback if AUTO)
     if (method == PATCH_METHOD_GOT) {
         // Should not reach here - GOT-only mode but no GOT entry
@@ -1059,14 +1168,16 @@ patch_set_prologue(patch_handle_t *handle, patch_prologue_fn prologue, void *use
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    if (handle->is_got_hook) {
-        patch__set_error("GOT hooks do not support prologue callbacks; use patch_set_replacement");
-        return PATCH_ERR_INVALID_ARGUMENT;
-    }
-
     // Check if this is a dispatcher-based hook (has prologue/epilogue support)
+    // GOT hooks can have dispatchers if they were installed with callbacks
     if (handle->dispatcher == nullptr) {
-        patch__set_error("simple replacement hooks do not support prologue callbacks");
+        if (handle->is_got_hook) {
+            patch__set_error("this GOT hook was installed with replacement mode; "
+                             "reinstall with callbacks to use prologue");
+        }
+        else {
+            patch__set_error("simple replacement hooks do not support prologue callbacks");
+        }
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -1086,13 +1197,16 @@ patch_set_epilogue(patch_handle_t *handle, patch_epilogue_fn epilogue, void *use
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    if (handle->is_got_hook) {
-        patch__set_error("GOT hooks do not support epilogue callbacks; use patch_set_replacement");
-        return PATCH_ERR_INVALID_ARGUMENT;
-    }
-
+    // Check if this is a dispatcher-based hook (has prologue/epilogue support)
+    // GOT hooks can have dispatchers if they were installed with callbacks
     if (handle->dispatcher == nullptr) {
-        patch__set_error("simple replacement hooks do not support epilogue callbacks");
+        if (handle->is_got_hook) {
+            patch__set_error("this GOT hook was installed with replacement mode; "
+                             "reinstall with callbacks to use epilogue");
+        }
+        else {
+            patch__set_error("simple replacement hooks do not support epilogue callbacks");
+        }
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
@@ -1115,13 +1229,16 @@ patch_set_callbacks(patch_handle_t   *handle,
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 
-    if (handle->is_got_hook) {
-        patch__set_error("GOT hooks do not support callbacks; use patch_set_replacement");
-        return PATCH_ERR_INVALID_ARGUMENT;
-    }
-
+    // Check if this is a dispatcher-based hook (has prologue/epilogue support)
+    // GOT hooks can have dispatchers if they were installed with callbacks
     if (handle->dispatcher == nullptr) {
-        patch__set_error("simple replacement hooks do not support callbacks");
+        if (handle->is_got_hook) {
+            patch__set_error("this GOT hook was installed with replacement mode; "
+                             "reinstall with callbacks to use prologue/epilogue");
+        }
+        else {
+            patch__set_error("simple replacement hooks do not support callbacks");
+        }
         return PATCH_ERR_INVALID_ARGUMENT;
     }
 

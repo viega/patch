@@ -29,7 +29,10 @@
 
 - [x] **vtable hooking** - Subsumed by watchpoint-guarded pointer hooks
 
-- [x] **GitHub Actions CI** - Add workflow for automated testing on Linux (x86-64 and ARM64) with hardware watchpoint support via `sysctl kernel.perf_event_paranoid=-1`
+- [x] **GitHub Actions CI** - Automated testing on Linux x86-64, Linux ARM64, macOS ARM64, and Docker
+  - **Note:** Hardware watchpoints may not work on GitHub-hosted runners due to Azure kernel restrictions on `perf_event_open`. See [issue #4974](https://github.com/actions/runner-images/issues/4974).
+  - For full hardware watchpoint testing, use a self-hosted runner with label `perf` and `kernel.perf_event_paranoid=-1`
+  - Core functionality (code patching, GOT hooking, breakpoint hooks) works on all runners
 
 - [ ] **Hook discovery** - Detect if a function is already hooked by another library
 

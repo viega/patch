@@ -25,10 +25,15 @@ jobs:
           clang --version
           meson --version
 
-      - name: Enable hardware watchpoints
+      - name: Configure hardware watchpoints
         run: |
-          sudo sysctl kernel.perf_event_paranoid=-1
-          cat /proc/sys/kernel/perf_event_paranoid
+          # Try to enable perf events for hardware watchpoints
+          # This may fail on some runners due to kernel/Azure restrictions
+          echo "Current perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || echo "Warning: Cannot set perf_event_paranoid (read-only)"
+          echo "After sysctl: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          # Show kernel version for debugging
+          uname -r
 
       - name: Build
         run: |
@@ -56,10 +61,13 @@ jobs:
           clang --version
           meson --version
 
-      - name: Enable hardware watchpoints
+      - name: Configure hardware watchpoints
         run: |
-          sudo sysctl kernel.perf_event_paranoid=-1
-          cat /proc/sys/kernel/perf_event_paranoid
+          # Try to enable perf events for hardware watchpoints
+          echo "Current perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || echo "Warning: Cannot set perf_event_paranoid (read-only)"
+          echo "After sysctl: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          uname -r
 
       - name: Build
         run: |
@@ -87,6 +95,9 @@ jobs:
       - name: Test
         run: meson test -C build -v
 
+  # Docker test - useful for isolated environment testing
+  # Note: Hardware watchpoints may not work in Docker even with --privileged
+  # due to kernel restrictions on perf_event_open
   test-docker:
     name: Docker (Linux x86-64)
     runs-on: ubuntu-latest
@@ -96,4 +107,40 @@ jobs:
       - name: Build and test in Docker
         run: |
           docker build -t patch-test --target test .
-          docker run --rm --privileged patch-test
+          docker run --rm --privileged \
+            --cap-add=SYS_PTRACE \
+            --cap-add=CAP_PERFMON \
+            --security-opt seccomp=unconfined \
+            patch-test
+
+  # Self-hosted runner job for full hardware watchpoint testing
+  # This job only runs if a self-hosted runner with the 'perf' label is available
+  # To set up: https://docs.github.com/en/actions/hosting-your-own-runners
+  test-linux-selfhosted:
+    name: Linux (Self-Hosted, Full HW Support)
+    runs-on: [self-hosted, linux, perf]
+    if: github.repository == 'viega/patch'  # Only run on main repo, not forks
+    continue-on-error: true  # Don't fail CI if no self-hosted runner available
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify perf_event access
+        run: |
+          echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
+          # Verify hardware watchpoints are available
+          cat /proc/sys/kernel/perf_event_paranoid
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld ninja-build libffi-dev python3-pip
+          pip3 install --user meson
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          CC=clang meson setup build
+          meson compile -C build
+
+      - name: Test with full hardware support
+        run: meson test -C build -v

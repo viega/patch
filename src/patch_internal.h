@@ -92,6 +92,12 @@ patch_error_t patch__trampoline_create(void            *target,
                                        size_t           prologue_size,
                                        bool             needs_relocation,
                                        patch__trampoline_t **out);
+
+// Create a passthrough "trampoline" that just points to an existing function.
+// Used for GOT hooks where no prologue relocation is needed.
+patch_error_t patch__trampoline_create_passthrough(void *original_func,
+                                                   patch__trampoline_t **out);
+
 void          patch__trampoline_destroy(patch__trampoline_t *tramp);
 
 // Dispatcher management - the dispatcher invokes callbacks and calls trampoline

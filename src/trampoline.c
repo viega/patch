@@ -81,6 +81,28 @@ patch__trampoline_create(void            *target,
     return PATCH_SUCCESS;
 }
 
+patch_error_t
+patch__trampoline_create_passthrough(void *original_func, patch__trampoline_t **out)
+{
+    patch__trampoline_t *tramp = calloc(1, sizeof(*tramp));
+    if (tramp == nullptr) {
+        patch__set_error("Failed to allocate trampoline structure");
+        return PATCH_ERR_ALLOCATION_FAILED;
+    }
+
+    // For passthrough trampolines (used by GOT hooks), the "code" pointer
+    // is just the original function address. No executable memory allocation
+    // is needed since we're not relocating any instructions.
+    tramp->code                 = original_func;
+    tramp->alloc_size           = 0;  // Indicates no memory to free
+    tramp->code_len             = 0;
+    tramp->original_target      = original_func;
+    tramp->original_prologue_len = 0;
+
+    *out = tramp;
+    return PATCH_SUCCESS;
+}
+
 void
 patch__trampoline_destroy(patch__trampoline_t *tramp)
 {
@@ -88,7 +110,9 @@ patch__trampoline_destroy(patch__trampoline_t *tramp)
         return;
     }
 
-    if (tramp->code != nullptr) {
+    // Only free if we allocated executable memory (alloc_size > 0)
+    // Passthrough trampolines have alloc_size = 0
+    if (tramp->code != nullptr && tramp->alloc_size > 0) {
         platform_free_exec(tramp->code, tramp->alloc_size);
     }
     free(tramp);

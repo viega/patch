@@ -118,9 +118,15 @@ test_hook_strlen(void)
     printf("  Hook installed!\n");
     g_strlen_call_count = 0;
 
-    size_t l1 = strlen("hello");
-    size_t l2 = strlen("world!");
-    size_t l3 = strlen("");
+    // Use volatile pointers to prevent compiler from optimizing strlen to constants
+    // Without this, the compiler computes strlen("hello") = 5 at compile time
+    volatile const char *s1 = "hello";
+    volatile const char *s2 = "world!";
+    volatile const char *s3 = "";
+
+    size_t l1 = strlen((const char *)s1);
+    size_t l2 = strlen((const char *)s2);
+    size_t l3 = strlen((const char *)s3);
 
     printf("  Lengths: %zu, %zu, %zu\n", l1, l2, l3);
     printf("  Hook called %d times\n", g_strlen_call_count);
