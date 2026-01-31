@@ -70,37 +70,67 @@ int platform_set_watchpoint(void *addr, size_t size, watchpoint_type_t type);
 // Returns PATCH_SUCCESS on success.
 patch_error_t platform_clear_watchpoint(int watchpoint_id);
 
-// Check if a watchpoint was hit and return its ID.
-// Called from signal handler context (Linux) or not used (macOS with Mach exceptions).
-// Returns watchpoint ID (0-3) if a watchpoint triggered, or -1 if not.
-int platform_check_watchpoint_hit(void *ucontext);
-
-// Get the address that triggered the watchpoint.
-// Called from signal handler context after platform_check_watchpoint_hit returns >= 0.
-void *platform_get_watchpoint_addr(void *ucontext, int watchpoint_id);
-
-#ifdef __APPLE__
-// macOS-specific: Register callback for watchpoint hits.
-// The callback is invoked from a dedicated exception handler thread (not signal context).
-// Note: On macOS, watchpoint exceptions are delivered via Mach exceptions, not signals.
-// The callback runs in a separate thread, NOT the faulting thread.
+// =============================================================================
+// Unified Watchpoint Callback API (Cross-Platform)
+// =============================================================================
 //
-// Callback parameters:
-//   wp_id        - which watchpoint was hit (0-3)
-//   thread       - the faulting thread (suspended during callback)
+// Both macOS (Mach exceptions) and Linux (SIGTRAP) use this unified callback API.
+// The platform layer handles the low-level details and calls the registered callback.
+//
+// Key semantic difference handled by platform layer:
+// - macOS: Write has NOT completed when callback is called (intercepted)
+// - Linux: Write HAS completed when callback is called (post-facto)
+//
+// The callback sees the same interface regardless of platform.
+
+// Watchpoint callback action
+typedef enum {
+    PLATFORM_WP_KEEP = 0,    // Keep hook active, update original to new_value
+    PLATFORM_WP_REMOVE = 1,  // Remove hook, let new value stand
+    PLATFORM_WP_REJECT = 2,  // Keep hook, reject the write (keep old original)
+} platform_wp_action_t;
+
+// Main watchpoint callback
+// Called when a watched address is written to.
+//
+// Parameters:
+//   watched_addr  - the address being watched
+//   new_value     - the value being written (or already written on Linux)
+//   restore_value - OUT: for KEEP/REJECT, set to value to restore (e.g., detour)
+//
+// Returns: action for platform to take
+typedef platform_wp_action_t (*platform_watchpoint_callback_t)(
+    void *watched_addr,
+    void *new_value,
+    void **restore_value
+);
+
+// ID update callback
+// Called after platform re-establishes watchpoint (Linux KEEP/REJECT).
+// On macOS, the watchpoint ID doesn't change, so this may not be called.
+//
+// Parameters:
 //   watched_addr - the address being watched
-//   old_value    - the current value at that address (before the write)
-//   new_value    - the value being written (decoded from registers)
-//
-// Callback returns:
-//   0 = KEEP:   Skip the write, keep the hook. Caller should update original_value.
-//   1 = REMOVE: Let the write proceed, remove the watchpoint.
-//   2 = REJECT: Skip the write, keep the old value. Hook stays with same original.
-//
-// Note: For KEEP and REJECT, the write instruction is skipped (PC advanced).
-//       For REMOVE, the write instruction proceeds normally.
-#include <mach/mach.h>
-typedef int (*platform_watchpoint_callback_t)(int wp_id, thread_t thread, void *watched_addr,
-                                              void *old_value, void *new_value);
-void platform_set_watchpoint_callback(platform_watchpoint_callback_t callback);
-#endif
+//   new_wp_id    - the new watchpoint ID after re-establishment
+typedef void (*platform_watchpoint_id_update_t)(
+    void *watched_addr,
+    int new_wp_id
+);
+
+// Register callbacks for watchpoint events.
+// Must be called before platform_watchpoint_init().
+// Pass NULL for id_update if not needed.
+void platform_set_watchpoint_callback(
+    platform_watchpoint_callback_t callback,
+    platform_watchpoint_id_update_t id_update
+);
+
+// Initialize watchpoint subsystem.
+// On macOS: starts Mach exception handler thread.
+// On Linux: installs SIGTRAP signal handler.
+// Returns PATCH_SUCCESS on success.
+patch_error_t platform_watchpoint_init(void);
+
+// Cleanup watchpoint subsystem.
+// Restores previous signal handler (Linux) or stops exception thread (macOS).
+void platform_watchpoint_cleanup(void);

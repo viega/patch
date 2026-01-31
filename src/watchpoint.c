@@ -4,22 +4,15 @@
 
 #include "platform/platform.h"
 
-#include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef __APPLE__
-#include <sys/ucontext.h>
-#else
-#include <ucontext.h>
-#endif
 
 // =============================================================================
 // Watchpoint Registry
 // =============================================================================
 //
-// Maps watched addresses to their hook handles for O(1) lookup in signal handler.
+// Maps watched addresses to their hook handles for O(1) lookup in callbacks.
 
 #define WATCHPOINT_HASH_SIZE 16
 
@@ -84,67 +77,20 @@ watchpoint_registry_find_by_addr(void *addr)
     return nullptr;
 }
 
-#ifndef __APPLE__
-static watchpoint_entry_t *
-watchpoint_registry_find_by_id(int wp_id)
-{
-    for (size_t i = 0; i < WATCHPOINT_HASH_SIZE; i++) {
-        for (watchpoint_entry_t *e = g_watchpoint_table[i]; e != nullptr; e = e->next) {
-            if (e->wp_id == wp_id) {
-                return e;
-            }
-        }
-    }
-    return nullptr;
-}
-// Find by address using the platform's watchpoint address lookup
-// (Linux only - macOS uses watchpoint_registry_find_by_addr directly)
-static watchpoint_entry_t *
-watchpoint_registry_find(void *ucontext, int wp_id)
-{
-    // First try to find by watchpoint ID
-    watchpoint_entry_t *entry = watchpoint_registry_find_by_id(wp_id);
-    if (entry != nullptr) {
-        return entry;
-    }
-
-    // Fall back to finding by address (from ucontext)
-    void *addr = platform_get_watchpoint_addr(ucontext, wp_id);
-    if (addr != nullptr) {
-        return watchpoint_registry_find_by_addr(addr);
-    }
-
-    return nullptr;
-}
-#endif
-
 // =============================================================================
-// Watchpoint Handler (Platform-Specific)
+// Unified Watchpoint Callback (Platform-Agnostic)
 // =============================================================================
 
 static atomic_bool g_handler_installed = false;
 
-#ifdef __APPLE__
-// =============================================================================
-// macOS: Mach Exception-based Handler
-// =============================================================================
-// On macOS, watchpoint exceptions are delivered via Mach exceptions.
-// The platform layer handles the exception server thread and calls our callback.
-// The callback runs in a DIFFERENT THREAD than the faulting code.
-// The write instruction has NOT completed when we're called (we intercept it).
-
-static int
-mach_watchpoint_callback(int wp_id, thread_t thread, void *watched_addr,
-                         void *old_value_from_platform, void *new_value)
+// Unified callback for watchpoint hits - called by platform layer
+static platform_wp_action_t
+watchpoint_callback(void *watched_addr, void *new_value, void **restore_value)
 {
-    (void)wp_id;   // Platform layer handles watchpoint clearing
-    (void)thread;
-    (void)old_value_from_platform; // Platform passes current memory value (detour), we use handle's original
-
-    // Find the watchpoint entry
     watchpoint_entry_t *entry = watchpoint_registry_find_by_addr(watched_addr);
     if (entry == nullptr || entry->handle == nullptr) {
-        return 1; // REMOVE - unknown watchpoint, let the write proceed
+        // Unknown watchpoint - let it proceed (REMOVE)
+        return PLATFORM_WP_REMOVE;
     }
 
     patch_handle_t *handle = entry->handle;
@@ -153,7 +99,7 @@ mach_watchpoint_callback(int wp_id, thread_t thread, void *watched_addr,
     // not the current memory value (which is our detour).
     void *old_value = handle->original_got_value;
 
-    // Determine action
+    // Determine action via user callback
     patch_watch_action_t action = PATCH_WATCH_KEEP;
 
     if (handle->watch_callback != nullptr) {
@@ -163,137 +109,44 @@ mach_watchpoint_callback(int wp_id, thread_t thread, void *watched_addr,
                                         handle->watch_user_data);
     }
 
-    // Return value tells platform layer what to do:
-    // 0 = KEEP:   Skip the write, keep the hook
-    // 1 = REMOVE: Let the write proceed, we'll clean up
-    // 2 = REJECT: Skip the write, keep old value
-
     switch (action) {
     case PATCH_WATCH_KEEP:
         // Update cached original (the new value the caller wanted to write)
-        // The detour stays in place (we skipped their write)
+        // The detour stays in place
         handle->original_got_value = new_value;
-        return 0; // Skip instruction
+        *restore_value = handle->detour_dest;
+        return PLATFORM_WP_KEEP;
 
     case PATCH_WATCH_REMOVE:
-        // Let the write proceed - platform layer clears watchpoint on faulting thread
-        // We just clean up our tracking state
+        // Clean up our tracking state
         watchpoint_registry_remove(watched_addr);
         handle->is_watchpoint_hook = false;
         handle->watchpoint_id = -1;
-        return 1; // Let write proceed
+        return PLATFORM_WP_REMOVE;
 
     case PATCH_WATCH_REJECT:
-        // Skip the write, keep detour and old original value
-        return 2; // Skip instruction
+        // Keep detour and old original value
+        *restore_value = handle->detour_dest;
+        return PLATFORM_WP_REJECT;
     }
 
-    return 0;
+    // Default: keep
+    *restore_value = handle->detour_dest;
+    return PLATFORM_WP_KEEP;
 }
 
-#else
-// =============================================================================
-// Linux: SIGTRAP-based Handler
-// =============================================================================
-// On Linux, watchpoint exceptions are delivered via SIGTRAP signal.
-// The write instruction has COMPLETED when we're called.
-
-static struct sigaction g_old_sigtrap_action;
-
+// ID update callback - called by platform after watchpoint re-establishment (Linux)
 static void
-sigtrap_handler(int sig, siginfo_t *info, void *ucontext_raw)
+watchpoint_id_update(void *watched_addr, int new_wp_id)
 {
-    (void)sig;
-    (void)info;
-
-    // Check if this is a watchpoint hit
-    int wp_id = platform_check_watchpoint_hit(ucontext_raw);
-
-    if (wp_id >= 0) {
-        // Find the watchpoint entry
-        watchpoint_entry_t *entry = watchpoint_registry_find(ucontext_raw, wp_id);
-
-        if (entry != nullptr && entry->handle != nullptr) {
-            patch_handle_t *handle = entry->handle;
-
-            // Read the new value that was written (write already completed on Linux)
-            void *new_value = *(void **)handle->watched_location;
-
-            // Get the old original value
-            void *old_value = handle->original_got_value;
-
-            // Determine action
-            patch_watch_action_t action = PATCH_WATCH_KEEP;
-
-            if (handle->watch_callback != nullptr) {
-                action = handle->watch_callback(handle,
-                                                old_value,
-                                                new_value,
-                                                handle->watch_user_data);
-            }
-
-            // Temporarily clear the watchpoint before writing to the watched location,
-            // otherwise our write will trigger another watchpoint hit
-            platform_clear_watchpoint(wp_id);
-
-            switch (action) {
-            case PATCH_WATCH_KEEP:
-                // Update cached original and reinstall detour
-                handle->original_got_value = new_value;
-                *(void **)handle->watched_location = handle->detour_dest;
-                // Re-enable watchpoint
-                {
-                    int new_wp_id =
-                        platform_set_watchpoint(handle->watched_location,
-                                                sizeof(void *),
-                                                WATCHPOINT_WRITE);
-                    handle->watchpoint_id = new_wp_id;
-                    if (entry != nullptr && new_wp_id >= 0) {
-                        entry->wp_id = new_wp_id;
-                    }
-                }
-                break;
-
-            case PATCH_WATCH_REMOVE:
-                // Let the new value stand, watchpoint already cleared
-                watchpoint_registry_remove(handle->watched_location);
-                handle->is_watchpoint_hook = false;
-                handle->watchpoint_id = -1;
-                break;
-
-            case PATCH_WATCH_REJECT:
-                // Reinstall detour with old original (ignore the update)
-                *(void **)handle->watched_location = handle->detour_dest;
-                // Re-enable watchpoint
-                {
-                    int new_wp_id =
-                        platform_set_watchpoint(handle->watched_location,
-                                                sizeof(void *),
-                                                WATCHPOINT_WRITE);
-                    handle->watchpoint_id = new_wp_id;
-                    if (entry != nullptr && new_wp_id >= 0) {
-                        entry->wp_id = new_wp_id;
-                    }
-                }
-                break;
-            }
-
-            return;
+    watchpoint_entry_t *entry = watchpoint_registry_find_by_addr(watched_addr);
+    if (entry != nullptr) {
+        entry->wp_id = new_wp_id;
+        if (entry->handle != nullptr) {
+            entry->handle->watchpoint_id = new_wp_id;
         }
-    }
-
-    // Not our watchpoint - chain to previous handler
-    if (g_old_sigtrap_action.sa_flags & SA_SIGINFO) {
-        if (g_old_sigtrap_action.sa_sigaction != nullptr) {
-            g_old_sigtrap_action.sa_sigaction(sig, info, ucontext_raw);
-        }
-    }
-    else if (g_old_sigtrap_action.sa_handler != SIG_IGN &&
-             g_old_sigtrap_action.sa_handler != SIG_DFL) {
-        g_old_sigtrap_action.sa_handler(sig);
     }
 }
-#endif // __APPLE__
 
 // =============================================================================
 // Public API
@@ -308,28 +161,18 @@ patch__watchpoint_init(void)
         return PATCH_SUCCESS;
     }
 
-#ifdef __APPLE__
-    // On macOS, register our callback with the platform layer.
-    // The Mach exception handler is started automatically when the first
-    // watchpoint is set via platform_set_watchpoint().
-    platform_set_watchpoint_callback(mach_watchpoint_callback);
-    return PATCH_SUCCESS;
-#else
-    // On Linux, use SIGTRAP signal handler
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigtrap_handler;
-    sa.sa_flags     = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
+    // Register callbacks with platform layer
+    platform_set_watchpoint_callback(watchpoint_callback, watchpoint_id_update);
 
-    if (sigaction(SIGTRAP, &sa, &g_old_sigtrap_action) != 0) {
+    // Initialize platform watchpoint subsystem
+    patch_error_t err = platform_watchpoint_init();
+    if (err != PATCH_SUCCESS) {
+        platform_set_watchpoint_callback(NULL, NULL);
         atomic_store(&g_handler_installed, false);
-        patch__set_error("failed to install SIGTRAP handler for watchpoints");
-        return PATCH_ERR_SIGNAL_HANDLER;
+        return err;
     }
 
     return PATCH_SUCCESS;
-#endif
 }
 
 void
@@ -340,13 +183,8 @@ patch__watchpoint_cleanup(void)
         return;
     }
 
-#ifdef __APPLE__
-    // On macOS, just clear the callback
-    platform_set_watchpoint_callback(NULL);
-#else
-    // On Linux, restore the old signal handler
-    sigaction(SIGTRAP, &g_old_sigtrap_action, nullptr);
-#endif
+    platform_watchpoint_cleanup();
+    platform_set_watchpoint_callback(NULL, NULL);
 }
 
 patch_error_t
@@ -431,6 +269,12 @@ patch__watchpoint_enable(patch_handle_t *handle)
     }
 
     handle->watchpoint_id = wp_id;
+
+    // Update registry with new ID
+    watchpoint_entry_t *entry = watchpoint_registry_find_by_addr(handle->watched_location);
+    if (entry != nullptr) {
+        entry->wp_id = wp_id;
+    }
 
     return PATCH_SUCCESS;
 }

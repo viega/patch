@@ -466,9 +466,9 @@ static mach_port_t g_exception_port           = MACH_PORT_NULL;
 static pthread_t   g_exception_thread         = 0;
 static atomic_bool g_exception_server_running = false;
 
-// Callback for watchpoint hits (set by watchpoint.c)
-// Uses platform_watchpoint_callback_t from platform.h
+// Callbacks for watchpoint hits (set by watchpoint.c via platform_set_watchpoint_callback)
 static platform_watchpoint_callback_t g_watchpoint_callback = NULL;
+static platform_watchpoint_id_update_t g_watchpoint_id_update = NULL;
 
 // Forward declaration - implemented in ARM64 section below
 #ifdef PATCH_ARCH_ARM64
@@ -644,7 +644,6 @@ exception_server_thread(void *arg)
         // Handle EXC_BREAKPOINT (includes watchpoints)
         if (msg.request.exception == EXC_BREAKPOINT) {
             thread_t faulting_thread = msg.request.thread.name;
-            int      action          = 0; // Default: KEEP
 
 #ifdef PATCH_ARCH_ARM64
             // Get exception state to find fault address
@@ -660,7 +659,6 @@ exception_server_thread(void *arg)
 
             if (wp_id >= 0 && g_watchpoint_callback != NULL) {
                 void *watched_addr = g_watchpoint_addr[wp_id];
-                void *old_value    = *(void **)watched_addr; // Current value (before write)
 
                 // Decode the store instruction to get the new value being written
                 uint64_t new_value_raw = 0;
@@ -669,24 +667,25 @@ exception_server_thread(void *arg)
                     new_value = (void *)new_value_raw;
                 }
 
-                // Call the watchpoint handler
-                action = g_watchpoint_callback(wp_id, faulting_thread, watched_addr,
-                                               old_value, new_value);
+                // Call the watchpoint handler with unified API
+                void *restore_value = NULL;
+                platform_wp_action_t wp_action = g_watchpoint_callback(
+                    watched_addr, new_value, &restore_value);
 
-                // Handle action: 0=KEEP, 1=REMOVE, 2=REJECT
-                if (action == 0 || action == 2) {
+                // Handle action
+                if (wp_action == PLATFORM_WP_KEEP || wp_action == PLATFORM_WP_REJECT) {
                     // KEEP or REJECT: Skip the instruction to prevent the write
+                    // Memory already has the correct value (restore_value/detour)
                     skip_current_instruction(faulting_thread);
                 }
-                else if (action == 1) {
+                else if (wp_action == PLATFORM_WP_REMOVE) {
                     // REMOVE: Clear watchpoint on faulting thread so write can proceed
                     clear_watchpoint_on_thread(wp_id, faulting_thread);
                 }
             }
 #else
-            // x86-64: TODO - implement similar logic
+            // x86-64: TODO - implement similar logic for watchpoint handling
             (void)faulting_thread;
-            (void)action;
 #endif
         }
 
@@ -773,12 +772,42 @@ init_mach_exception_handler(void)
     return PATCH_SUCCESS;
 }
 
-// Set callback for watchpoint hits
-// Callback returns: 0=KEEP, 1=REMOVE, 2=REJECT
+// Set callbacks for watchpoint hits (unified API)
 void
-platform_set_watchpoint_callback(platform_watchpoint_callback_t callback)
+platform_set_watchpoint_callback(platform_watchpoint_callback_t callback,
+                                 platform_watchpoint_id_update_t id_update)
 {
     g_watchpoint_callback = callback;
+    g_watchpoint_id_update = id_update;
+    (void)g_watchpoint_id_update; // Not used on macOS - watchpoint ID doesn't change
+}
+
+// Initialize watchpoint subsystem
+patch_error_t
+platform_watchpoint_init(void)
+{
+    // On macOS, the Mach exception handler is initialized lazily
+    // when the first watchpoint is set (in platform_set_watchpoint).
+    // Nothing to do here.
+    return PATCH_SUCCESS;
+}
+
+// Cleanup watchpoint subsystem
+void
+platform_watchpoint_cleanup(void)
+{
+    // Stop exception server thread if running
+    if (atomic_load(&g_exception_server_running)) {
+        atomic_store(&g_exception_server_running, false);
+        if (g_exception_thread != 0) {
+            pthread_join(g_exception_thread, NULL);
+            g_exception_thread = 0;
+        }
+        if (g_exception_port != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), g_exception_port);
+            g_exception_port = MACH_PORT_NULL;
+        }
+    }
 }
 
 #ifdef PATCH_ARCH_X86_64

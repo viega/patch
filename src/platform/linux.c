@@ -537,3 +537,126 @@ platform_get_watchpoint_addr(void *ucontext, int watchpoint_id)
 
     return g_watchpoint_addr[watchpoint_id];
 }
+
+// =============================================================================
+// Watchpoint Callback Support (SIGTRAP Handler)
+// =============================================================================
+
+// Registered callbacks
+static platform_watchpoint_callback_t g_watchpoint_callback = NULL;
+static platform_watchpoint_id_update_t g_watchpoint_id_update = NULL;
+
+// Previous signal handler for chaining
+static struct sigaction g_old_sigtrap_action;
+static atomic_bool g_sigtrap_handler_installed = false;
+
+// SIGTRAP signal handler for watchpoint events
+static void
+sigtrap_handler(int sig, siginfo_t *info, void *ucontext_raw)
+{
+    (void)sig;
+    (void)info;
+
+    // Check if this is a watchpoint hit
+    int wp_id = platform_check_watchpoint_hit(ucontext_raw);
+
+    if (wp_id >= 0 && g_watchpoint_callback != NULL) {
+        void *watched_addr = g_watchpoint_addr[wp_id];
+        if (watched_addr == NULL) {
+            goto chain;
+        }
+
+        // Read the new value that was written (write already completed on Linux)
+        void *new_value = *(void **)watched_addr;
+
+        // Temporarily clear the watchpoint before any writes to the watched location
+        platform_clear_watchpoint(wp_id);
+
+        // Call the watchpoint handler with unified API
+        void *restore_value = NULL;
+        platform_wp_action_t action = g_watchpoint_callback(
+            watched_addr, new_value, &restore_value);
+
+        switch (action) {
+        case PLATFORM_WP_KEEP:
+        case PLATFORM_WP_REJECT:
+            // Write the restore value (detour) back to the watched location
+            if (restore_value != NULL) {
+                *(void **)watched_addr = restore_value;
+            }
+            // Re-enable watchpoint
+            {
+                int new_wp_id = platform_set_watchpoint(
+                    watched_addr, sizeof(void *), WATCHPOINT_WRITE);
+                if (new_wp_id >= 0 && g_watchpoint_id_update != NULL) {
+                    g_watchpoint_id_update(watched_addr, new_wp_id);
+                }
+            }
+            break;
+
+        case PLATFORM_WP_REMOVE:
+            // Let the new value stand, watchpoint already cleared
+            // Callback is responsible for cleaning up its own state
+            break;
+        }
+
+        return;
+    }
+
+chain:
+    // Not our watchpoint - chain to previous handler
+    if (g_old_sigtrap_action.sa_flags & SA_SIGINFO) {
+        if (g_old_sigtrap_action.sa_sigaction != NULL) {
+            g_old_sigtrap_action.sa_sigaction(sig, info, ucontext_raw);
+        }
+    }
+    else if (g_old_sigtrap_action.sa_handler != SIG_IGN &&
+             g_old_sigtrap_action.sa_handler != SIG_DFL) {
+        g_old_sigtrap_action.sa_handler(sig);
+    }
+}
+
+void
+platform_set_watchpoint_callback(platform_watchpoint_callback_t callback,
+                                 platform_watchpoint_id_update_t id_update)
+{
+    g_watchpoint_callback = callback;
+    g_watchpoint_id_update = id_update;
+}
+
+patch_error_t
+platform_watchpoint_init(void)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_sigtrap_handler_installed, &expected, true)) {
+        // Already initialized
+        return PATCH_SUCCESS;
+    }
+
+    // Install SIGTRAP signal handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigtrap_handler;
+    sa.sa_flags     = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+
+    if (sigaction(SIGTRAP, &sa, &g_old_sigtrap_action) != 0) {
+        atomic_store(&g_sigtrap_handler_installed, false);
+        patch__set_error("failed to install SIGTRAP handler for watchpoints");
+        return PATCH_ERR_SIGNAL_HANDLER;
+    }
+
+    return PATCH_SUCCESS;
+}
+
+void
+platform_watchpoint_cleanup(void)
+{
+    bool expected = true;
+    if (!atomic_compare_exchange_strong(&g_sigtrap_handler_installed, &expected, false)) {
+        return;
+    }
+
+    // Restore the old signal handler
+    sigaction(SIGTRAP, &g_old_sigtrap_action, NULL);
+}
